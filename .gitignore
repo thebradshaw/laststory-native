@@ -1,0 +1,13 @@
+# Never commit game data or anything derived from it.
+*.wbfs
+*.iso
+*.rvz
+*.wia
+*.zip*
+*.dol
+*.rso
+*.sel
+extracted/
+build/
+# Translated C++ is derived from the game's code.
+functions/
