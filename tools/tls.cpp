@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
 
 namespace {
@@ -67,7 +68,47 @@ void hitch_watch() {
 // once the ring is empty: its next frame's commands meet no breakpoint.
 // (TLS_AHEAD=1: the engine's own rule, a frame ahead.)
 bool ahead = std::getenv("TLS_AHEAD") != nullptr;
+
+// The frame rate. The engine was written for 30 or 60 frames a second: its
+// settings object (-0x6618(r13)) holds the rate at +0x30, read in 51 places
+// (physics scale by its square, timers by it), and the frame's update
+// (80479D8C) tells the graphics device to flip every other retrace only
+// when it is 30. The disc ships 30. TLS_FPS=60 (or 30) sets it; the default
+// here is 60. TLS_FPSLOG=1 reports the frames presented per guest second.
+constexpr uint32_t kSda = 0x808856C0, kSettings = kSda - 0x6618;
+uint32_t want_fps = [] { const char* e = std::getenv("TLS_FPS"); int v = e ? std::atoi(e) : 60; return v == 30 ? 30u : 60u; }();
+bool fpslog = std::getenv("TLS_FPSLOG") != nullptr;
+uint64_t fps_t0 = 0;
+uint32_t fps_n = 0;
+void frame_rate() {
+    uint32_t s = ld32(kSettings);
+    if (s && ld32(s + 0x30) != want_fps) {
+        rt_log("tls: frame rate %u -> %u", ld32(s + 0x30), want_fps);
+        st32(s + 0x30, want_fps);
+    }
+    if (!fpslog) return;
+    uint64_t t = os_tb_now();
+    if (!fps_t0) fps_t0 = t;
+    fps_n++;
+    if (t - fps_t0 >= 60750000ull * 5) {
+        uint32_t gd = ld32(kSda - 0x67E0), ef = ld32(kSda - 0x6718), sp = ef ? ld32(ef + 0x3A4) : 0;
+        float spf; std::memcpy(&spf, &sp, 4);
+        rt_log("tls: %.1f frames a second (every other retrace: %u, effects speed %.3f)",
+               fps_n / ((t - fps_t0) / 60750000.0), gd ? ld32(gd + 0xCC) : 9, spf);
+        fps_t0 = t; fps_n = 0;
+    }
+}
+
+// The effects are the one clock that ignores the rate: their update is
+// handed 1.0 frame at every frame (80239BFC). At 60 it gets half a frame.
+PPCFunc o_eff;
+void eff_update(PPCContext& c) {
+    c.f[1] *= 30.0 / want_fps;
+    o_eff(c);
+}
+
 void swap_frame(PPCContext& c) {
+    frame_rate();
     if (hitch_on) {
         int64_t now = now_us(), last = swap_at.exchange(now);
         uint32_t n = swaps.fetch_add(1) + 1;
@@ -116,6 +157,7 @@ void unswizzle(PPCContext& c) {                       // (data, format, w, h)
 void install() {
     o_unswizzle = ppc_hook("atnTex_Unswizzle", unswizzle);
     o_swap = ppc_hook("atnGfx_SwapFrame", swap_frame);
+    o_eff = ppc_hook("atnEff_Update", eff_update);
     o_post = ppc_hook("atnGfx_PostRetrace", post_retrace);
     // The game plays with the Classic Controller (or the Remote and Nunchuk,
     // which wiikit has no Nunchuk for); it learns of controllers from KPAD's
