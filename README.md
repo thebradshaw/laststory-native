@@ -18,8 +18,8 @@ in the style of the title screen that walks the player through adding their disc
 
 ## Where it stands
 
-The USA disc boots and plays into Chapter 1 (`docs/usa.md`), with the engine set to 60 frames a
-second (`docs/60fps.md`, still to be measured on a GPU). Next:
+The USA disc boots and plays into Chapter 1 (`docs/usa.md`) at 30 frames a second. 60 is an
+experiment (`TLS_FPS=60`, `docs/60fps.md`). Next:
 the rest of the goals above.
 
 ## BYOA: Bring Your Own Assets
