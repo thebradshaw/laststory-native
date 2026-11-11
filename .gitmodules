@@ -1,3 +1,3 @@
-[submodule "external/Wiicompiled"]
-	path = external/Wiicompiled
-	url = https://github.com/patchzyy/Wiicompiled
+[submodule "wiikit"]
+	path = wiikit
+	url = https://github.com/vs-sr-dev/wiikit.git
