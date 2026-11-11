@@ -10,6 +10,9 @@
 #include <cstring>
 #include <thread>
 
+// Half at 60 frames a second: what the recompiled code multiplies the engine's speed by (speed60.py).
+double g_tls_speed = [] { const char* e = std::getenv("TLS_FPS"); return e && std::atoi(e) == 60 ? 0.5 : 1.0; }();
+
 namespace {
 
 // The engine's frame ring (atn_graphics_device.cpp): 5 x {FIFO wptr, 0, XFB,
@@ -69,42 +72,47 @@ void hitch_watch() {
 // (TLS_AHEAD=1: the engine's own rule, a frame ahead.)
 bool ahead = std::getenv("TLS_AHEAD") != nullptr;
 
-// The frame rate. The engine was written for 30 or 60 frames a second: its
-// settings object (-0x6618(r13)) holds the rate at +0x30, read in 51 places
-// (physics scale by its square, timers by it), and the frame's update
-// (80479D8C) tells the graphics device to flip every other retrace only
-// when it is 30. The disc ships 30. TLS_FPS=60 (or 30) sets it; the default
-// here is 60. TLS_FPSLOG=1 reports the frames presented per guest second.
-constexpr uint32_t kSda = 0x808856C0, kSettings = kSda - 0x6618;
-uint32_t want_fps = [] { const char* e = std::getenv("TLS_FPS"); int v = e ? std::atoi(e) : 60; return v == 30 ? 30u : 60u; }();
+// The frame rate. The engine steps by frames, 30 a second: its settings hold
+// a rate (+0x30 of the object at -0x6618(r13)), but only gravity reads it
+// (51 places, by its square); set to 60 alone, the game ran at twice its
+// speed (the first build that tried). What the whole world does follow is
+// the engine's one speed, the slow motion's (+0x3A4 of the object at
+// -0x6718(r13)). TLS_FPS=60: the frames flip at every retrace (the graphics
+// device's +0xCC cleared before its retrace callbacks read it) and every
+// consumer of the speed is handed half of it (g_tls_speed, by
+// tools/speed60.py in the recompiled code): half steps, twice as often.
+// What does not follow the speed runs twice as fast: an experiment.
+// TLS_FPSLOG=1 reports the frames presented per guest second.
+constexpr uint32_t kSda = 0x808856C0;
+uint32_t want_fps = [] { const char* e = std::getenv("TLS_FPS"); return e && std::atoi(e) == 60 ? 60u : 30u; }();
 bool fpslog = std::getenv("TLS_FPSLOG") != nullptr;
 uint64_t fps_t0 = 0;
 uint32_t fps_n = 0;
+void every_retrace() {
+    if (want_fps != 60) return;
+    if (uint32_t gd = ld32(kSda - 0x67E0)) st32(gd + 0xCC, 0);
+}
 void frame_rate() {
-    uint32_t s = ld32(kSettings);
-    if (s && ld32(s + 0x30) != want_fps) {
-        rt_log("tls: frame rate %u -> %u", ld32(s + 0x30), want_fps);
-        st32(s + 0x30, want_fps);
-    }
     if (!fpslog) return;
     uint64_t t = os_tb_now();
     if (!fps_t0) fps_t0 = t;
     fps_n++;
     if (t - fps_t0 >= 60750000ull * 5) {
-        uint32_t gd = ld32(kSda - 0x67E0), ef = ld32(kSda - 0x6718), sp = ef ? ld32(ef + 0x3A4) : 0;
-        float spf; std::memcpy(&spf, &sp, 4);
-        rt_log("tls: %.1f frames a second (every other retrace: %u, effects speed %.3f)",
-               fps_n / ((t - fps_t0) / 60750000.0), gd ? ld32(gd + 0xCC) : 9, spf);
+        rt_log("tls: %.1f frames a second", fps_n / ((t - fps_t0) / 60750000.0));
         fps_t0 = t; fps_n = 0;
     }
 }
 
-// The effects are the one clock that ignores the rate: their update is
-// handed 1.0 frame at every frame (80239BFC). At 60 it gets half a frame.
-PPCFunc o_eff;
-void eff_update(PPCContext& c) {
-    c.f[1] *= 30.0 / want_fps;
-    o_eff(c);
+// The wrist strap screen (StrapTask, its state at +0x48: 1 fading in, 0
+// waiting for a button or 599 frames, 2 fading out over 15 frames, then the
+// next sequence). Sent straight to the end of its fade out. TLS_STRAP=1
+// keeps it.
+bool strap = std::getenv("TLS_STRAP") != nullptr;
+PPCFunc o_strap;
+void strap_update(PPCContext& c) {
+    uint32_t t = c.r[3], state = ld32(t + 0x48);
+    if (!strap && state <= 1) { st32(t + 0x48, 2); st32(t + 0x4C, 14); }
+    o_strap(c);
 }
 
 void swap_frame(PPCContext& c) {
@@ -135,6 +143,7 @@ void swap_frame(PPCContext& c) {
 // once with the wait above). The ring's queue is woken at every retrace too:
 // a lost wake-up costs a retrace at most.
 void post_retrace(PPCContext& c) {
+    every_retrace();
     ring("post", c);
     o_post(c);
     c.r[3] = kRingQueue;
@@ -157,7 +166,9 @@ void unswizzle(PPCContext& c) {                       // (data, format, w, h)
 void install() {
     o_unswizzle = ppc_hook("atnTex_Unswizzle", unswizzle);
     o_swap = ppc_hook("atnGfx_SwapFrame", swap_frame);
-    o_eff = ppc_hook("atnEff_Update", eff_update);
+    o_strap = ppc_hook("StrapTask_Update", strap_update);
+    o_pre = ppc_hook("atnGfx_PreRetrace", [](PPCContext& c) { every_retrace(); ring("pre", c); o_pre(c); });
+    if (want_fps == 60) rt_log("tls: 60 frames a second (experimental), the speed halved");
     o_post = ppc_hook("atnGfx_PostRetrace", post_retrace);
     // The game plays with the Classic Controller (or the Remote and Nunchuk,
     // which wiikit has no Nunchuk for); it learns of controllers from KPAD's
@@ -173,7 +184,6 @@ void install() {
     }
     if (!gfxtrace) return;
     o_bp = ppc_hook("atnGfx_BreakPtCallback", [](PPCContext& c) { ring("bp", c); o_bp(c); ring("bp>", c); });
-    o_pre = ppc_hook("atnGfx_PreRetrace", [](PPCContext& c) { ring("pre", c); o_pre(c); });
 }
 
 RtGameLayer layer("The Last Story", install);

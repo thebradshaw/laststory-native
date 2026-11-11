@@ -1,0 +1,89 @@
+diff --git a/runtime/video.cpp b/runtime/video.cpp
+index 80d48fd..141acd5 100644
+--- a/runtime/video.cpp
++++ b/runtime/video.cpp
+@@ -225,6 +225,30 @@ void save_program(GLuint p, uint64_t hash) {
+     }
+ }
+ 
++// The programs' sources, kept beside the binaries (shadercache/sources): a
++// binary is the driver's, a source is anyone's. Every program linked leaves
++// its source there, and at start every source there is made a program
++// (from its binary, or linked and its binary kept): what was drawn once, on
++// this machine or on the one that made the list, costs nothing in play.
++uint64_t plain_hash(const std::string& source) {
++    uint64_t h = 0xCBF29CE484222325ull;
++    for (unsigned char ch : source) h = (h ^ ch) * 0x100000001B3ull;
++    return h;
++}
++void save_source(const std::string& source) {
++    if (opt.shader_cache.empty()) return;
++    std::error_code ec;
++    std::filesystem::create_directories(opt.shader_cache + "/sources", ec);
++    char name[40];
++    std::snprintf(name, sizeof name, "/sources/%016llx.src", (unsigned long long)plain_hash(source));
++    std::string path = opt.shader_cache + name;
++    if (std::filesystem::exists(path, ec)) return;
++    if (FILE* f = std::fopen(path.c_str(), "wb")) {
++        std::fwrite(source.data(), 1, source.size(), f);
++        std::fclose(f);
++    }
++}
++
+ void ensure_tex(Tex& t, int w, int h, int levels) {
+     if (t.name && t.w == w && t.h == h && t.levels == levels) return;
+     if (t.name) glDeleteTextures(1, &t.name);
+@@ -386,6 +410,37 @@ void bp_set(uint32_t v) {
+ }
+ 
+ // ---- draws --------------------------------------------------------------------------------------
++void preload_programs() {
++    if (opt.shader_cache.empty()) return;
++    std::error_code ec;
++    std::filesystem::directory_iterator it(opt.shader_cache + "/sources", ec), end;
++    if (ec) return;
++    auto t0 = std::chrono::steady_clock::now();
++    unsigned n = 0, linked = 0;
++    for (; it != end; it.increment(ec)) {
++        if (it->path().extension() != ".src") continue;
++        FILE* f = std::fopen(it->path().string().c_str(), "rb");
++        if (!f) continue;
++        std::string source;
++        char buf[65536];
++        for (size_t k; (k = std::fread(buf, 1, sizeof buf, f)) > 0;) source.append(buf, k);
++        std::fclose(f);
++        size_t cut = source.find('\0');
++        if (cut == std::string::npos || programs_by_source.count(source)) continue;
++        uint64_t hash = source_hash(source);
++        GLuint p = load_program(hash);
++        if (!p) {
++            if (!(p = link(source.substr(0, cut), source.substr(cut + 1)))) continue;
++            save_program(p, hash);
++            linked++;
++        }
++        programs_by_source.emplace(std::move(source), p);
++        n++;
++    }
++    rt_log("video: %u programs ready before play (%u linked now) in %.2f s", n, linked,
++           std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
++}
++
+ GLuint program_for(uint8_t vflags) {
+     std::string key = gx_shader_key(bp, xf, vflags);
+     auto it = programs.find(key);
+@@ -401,6 +456,7 @@ GLuint program_for(uint8_t vflags) {
+     GLuint p = load_program(hash);
+     if (p) ++cnt.cached;
+     else if ((p = link(vs, fs))) { ++cnt.linked; save_program(p, hash); }
++    if (p) save_source(source);
+     programs_by_source.emplace(std::move(source), p);
+     if (const char* dir = std::getenv("WIIKIT_SHADERDUMP")) {           // debugging: the sources
+         std::string path = std::string(dir) + "/prog_" + std::to_string(cnt.programs) + ".glsl";
+@@ -1391,6 +1447,7 @@ void setup() {
+     if (!copy_prog) rt_die("video: the EFB copy program does not build");
+     copy_rect_loc = glGetUniformLocation(copy_prog, "u_rect");
+     copy_mode_loc = glGetUniformLocation(copy_prog, "u_mode");
++    preload_programs();
+ }
+ 
+ }  // namespace

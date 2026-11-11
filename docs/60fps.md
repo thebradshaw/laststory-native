@@ -1,31 +1,40 @@
 # 60 frames a second
 
-The engine already knows two frame rates. Its settings object (`-0x6618(r13)`) holds the rate at
-`+0x30`, and the disc sets 30.
+Status: experimental (`TLS_FPS=60`). The default is the disc's 30.
 
-- 51 places read it: physics scale by its square (`mullw r0,r0,r0` at 8010FD20, 80198D70,
-  80567C70), timers by it.
-- The frame's update (80479D7C-80479D8C) tells the graphics device to flip on every other
-  retrace only when the rate is 30 (`atnGfx` `+0xCC`, read by `atnGfx_PreRetrace`).
-- The effects are the exception: `atnEff_Update` (8023686C) is handed the constant 1.0 frame at
-  every frame by its one caller (80239BFC), and the effects' speed (`+0x3A4`) stays 1.0.
+## What the engine does
 
-`tools/tls.cpp` writes the wanted rate into the settings at each frame's end and scales the
-effects' step by 30 / rate. `TLS_FPS=30` restores the disc's rate; the default is 60.
-`TLS_FPSLOG=1` logs the frames presented per second, the flip flag and the effects' speed.
+The engine steps by frames, 30 a second, and flips on every other retrace
+(`atnGfx` `+0xCC`, set at each update by 80479D8C from the settings' rate, read by
+`atnGfx_PreRetrace` and `atnGfx_PostRetrace`).
+
+Its settings (`Config`, the object at `-0x6618(r13)`) hold a rate at `+0x30`, 30 on the disc.
+Only gravity reads it: 51 places, each by its square (`mullw r0,r0,r0`).
+
+## First try: the settings' rate (wrong)
+
+Setting the rate to 60 makes the frames flip at every retrace, and nothing else follows:
+on a GPU the game ran at twice its speed, with sound distortion on the title's confirm
+(reported from the first Windows test build, 2026-11-11).
+
+## Second try: the engine's slow motion
+
+The engine has one global speed: `+0x3A4` of the object at `-0x6718(r13)`, 1.0, less in slow
+motion. 119 places read it through that pointer and 47 store it, in 32 functions; gravity's 51
+sites read it too, and so do the effects (`atnEff_Advance`).
+
+With `TLS_FPS=60`:
+
+- `tools/tls.cpp` clears `+0xCC` before the retrace callbacks read it: a flip at every retrace.
+- `tools/speed60.py` patches the recompiled C++: the 107 reads of the speed outside the
+  functions that store it, and the getter at 802F0988, multiply it by `g_tls_speed` (0.5).
+  The world moves in half steps, twice as often.
+
+What does not follow the speed will run twice as fast. Candidates, to be checked on a GPU:
+menus and 2D animations, cutscenes (the event system has its own frame counters), timers,
+the camera.
 
 ## Tested
 
-USA disc, Linux, Mesa llvmpipe (software rendering) under Xvfb, 2026-11-11:
-
-- With 60 the flip flag reads 0 (every retrace); with 30 it reads 1.
-- At 60 the game runs from boot through the title, New Game and into Chapter 1's first
-  tutorial ("Movement and Camera") without errors: 2,455 frames in a 295 s run.
-
-Not measured: a real 60. Software rendering holds about 7 frames a second in 3D scenes here at
-either setting, so speed and smoothness need a run on a GPU. Things to watch on one: cutscene
-timing and lip sync, `.motion` playback (authored at 30), THP movies, and anything that still
-counts frames (the effects were one).
-
-Seen once at 30 under this load: the game stopped after its third frame, the lost wake-up the
-upstream notes describe (`docs/upstream/03-executable.md`). A second run was fine.
+Linux, software rendering, so no real frame rates: at 60 the game runs from boot into
+Chapter 1's first tutorial without errors. Speeds are unverified until a run on a GPU.

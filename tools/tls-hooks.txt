@@ -6,4 +6,4 @@ atnGfx_PreRetrace
 atnGfx_PostRetrace
 atnTex_Unswizzle
 atnTex_Composite
-atnEff_Update
+StrapTask_Update
