@@ -25,7 +25,7 @@
 #endif
 
 // Half at 60 frames a second: what the recompiled code multiplies the engine's speed by (speed60.py).
-double g_tls_speed = [] { const char* e = std::getenv("TLS_FPS"); return e && std::atoi(e) == 60 ? 0.5 : 1.0; }();
+double g_tls_speed = [] { const char* e = std::getenv("TLS_SLOWMO60"); return e && *e == '1' ? 0.5 : 1.0; }();
 
 namespace {
 
@@ -91,14 +91,14 @@ bool ahead = std::getenv("TLS_AHEAD") != nullptr;
 // (51 places, by its square); set to 60 alone, the game ran at twice its
 // speed (the first build that tried). What the whole world does follow is
 // the engine's one speed, the slow motion's (+0x3A4 of the object at
-// -0x6718(r13)). TLS_FPS=60: the frames flip at every retrace (the graphics
+// -0x6718(r13)). TLS_SLOWMO60=1: the frames flip at every retrace (the graphics
 // device's +0xCC cleared before its retrace callbacks read it) and every
 // consumer of the speed is handed half of it (g_tls_speed, by
 // tools/speed60.py in the recompiled code): half steps, twice as often.
 // What does not follow the speed runs twice as fast: an experiment.
 // TLS_FPSLOG=1 reports the frames presented per guest second.
 constexpr uint32_t kSda = 0x808856C0;
-uint32_t want_fps = [] { const char* e = std::getenv("TLS_FPS"); return e && std::atoi(e) == 60 ? 60u : 30u; }();
+uint32_t want_fps = [] { const char* e = std::getenv("TLS_SLOWMO60"); return e && *e == '1' ? 60u : 30u; }();
 bool fpslog = std::getenv("TLS_FPSLOG") != nullptr;
 uint64_t fps_t0 = 0;
 uint32_t fps_n = 0;
@@ -276,7 +276,7 @@ void install() {
     o_hbm_create = ppc_hook("HBMRsoCreate", hbm_create);
     if (!std::getenv("TLS_RESET_QUITS")) ppc_hook("OSRestart", restart);
     o_pre = ppc_hook("atnGfx_PreRetrace", [](PPCContext& c) { every_retrace(); ring("pre", c); o_pre(c); });
-    if (want_fps == 60) rt_log("tls: 60 frames a second (experimental), the speed halved");
+    if (want_fps == 60) rt_log("tls: 60 frames a second (the slow motion experiment), the speed halved");
     o_post = ppc_hook("atnGfx_PostRetrace", post_retrace);
     // The game plays with the Classic Controller (or the Remote and Nunchuk,
     // which wiikit has no Nunchuk for); it learns of controllers from KPAD's

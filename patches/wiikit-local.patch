@@ -1,8 +1,55 @@
 diff --git a/runtime/video.cpp b/runtime/video.cpp
-index 80d48fd..d5fc72e 100644
+index 80d48fd..44863b6 100644
 --- a/runtime/video.cpp
 +++ b/runtime/video.cpp
-@@ -225,6 +225,30 @@ void save_program(GLuint p, uint64_t hash) {
+@@ -29,6 +29,7 @@
+ #include <filesystem>
+ #include <mutex>
+ #include <string>
++#include <tuple>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -114,6 +115,38 @@ std::unordered_map<std::string, GLuint> programs_by_source;
+ struct Counters { uint64_t frames, presents, draws, programs, linked, cached; } cnt;
+ bool dump_ps = false;                              // WIIKIT_SHADERDUMP: log the next uniforms
+ 
++// ---- frame interpolation (--interpolate) ----------------------------------------------------------
++// The game draws 30 frames a second; the screen shows 60. Each frame's
++// record is kept, and once a frame is complete (its XFB copy) it is drawn
++// a second time, before it is shown, as the frame halfway from the one
++// before: each draw found in the frame before (by what it draws: primitive,
++// vertex format and count, textures, matrix) gets its matrices (position,
++// texture, normal, projection) halfway between the two frames', and its
++// vertices too when they moved on the CPU (skinning). What is not found,
++// or moved too far (a cut), is drawn where it is. The halfway frame has
++// its own EFB and EFB copies, and the game's state is untouched by it: it
++// is shown at one retrace and the real frame at the next, a retrace later
++// than without (17 ms). The game itself runs exactly as before.
++constexpr uint32_t XI_POS = 0x100, XI_NRM = 0x60, XI_PRJ = 7, XI_WORDS = XI_POS + XI_NRM + XI_PRJ;
++struct DrawRec { uint64_t key, loose; size_t vtx_at, vtx_len; };
++struct FrameRec { std::vector<uint8_t> stream; std::vector<DrawRec> draws; std::vector<uint32_t> xfs; };
++FrameRec fr_prev, fr_cur;
++std::unordered_map<uint64_t, std::vector<uint32_t>> prev_by_key, prev_by_loose;
++std::unordered_map<uint64_t, uint32_t> occ_key, occ_loose;
++struct GXState { uint32_t bp[0x100], xf[0x1058]; int32_t reg[4][4], konst[4][4]; uint64_t maps[8]; };
++GXState st_start, st_live;
++std::unordered_map<uint32_t, Tex> mid_copies;      // the halfway frame's EFB copies
++Tex mid_xfb;
++std::deque<std::pair<bool, uint32_t>> showq;       // to show at the next retraces: the halfway frame, or an XFB
++std::pair<bool, uint32_t> showing{false, 0};
++uint32_t prev_shown = 0;                           // the frame before's XFB
++bool showing_set = false;
++bool st_start_ok = false;
++bool mid_mode = false, frame_ended = false, mid_xfb_made = false;
++const uint8_t* cmd_start = nullptr;                // the command being executed
++GLuint mid_fbo, mid_col, mid_dep, start_fbo, start_col, start_dep;
++struct InterpStats { uint64_t frames, draws, matched, loose, vtx; } ist;
++
+ int32_t s11(uint32_t v) { return (int32_t)((v & 0x7FF) << 21) >> 21; }
+ int32_t s10(uint32_t v) { return (int32_t)((v & 0x3FF) << 22) >> 22; }
+ float fx(uint32_t a) { float f; std::memcpy(&f, &xf[a], 4); return f; }
+@@ -225,6 +258,30 @@ void save_program(GLuint p, uint64_t hash) {
      }
  }
  
@@ -33,7 +80,41 @@ index 80d48fd..d5fc72e 100644
  void ensure_tex(Tex& t, int w, int h, int levels) {
      if (t.name && t.w == w && t.h == h && t.levels == levels) return;
      if (t.name) glDeleteTextures(1, &t.name);
-@@ -386,6 +410,37 @@ void bp_set(uint32_t v) {
+@@ -332,24 +389,28 @@ void efb_copy(uint32_t v) {
+     int w = (int)(bp[0x4A] & 0x3FF) + 1, h = (int)(bp[0x4A] >> 10 & 0x3FF) + 1;
+     uint32_t dest = (bp[0x4B] & 0xFFFFFF) << 5;
+     glDisable(GL_SCISSOR_TEST);
+-    if (efb_dumping()) {
++    if (efb_dumping() && !mid_mode) {
+         char tag[64];
+         std::snprintf(tag, sizeof tag, "copy_%06X_%d_%d_%dx%d", v, x, y, w, h);
+         efb_dump(tag);
+     }
+     if (v >> 14 & 1) {                                           // to the XFB
+-        Tex& t = xfbs[dest];
++        Tex& t = mid_mode ? mid_xfb : xfbs[dest];
+         ensure_tex(t, w * S, h * S, 1);
+         glNamedFramebufferTexture(copy_fbo, GL_COLOR_ATTACHMENT0, t.name, 0);
+         glBlitNamedFramebuffer(efb_fbo, copy_fbo, x * S, y * S, (x + w) * S, (y + h) * S, 0, 0, w * S, h * S,
+                                GL_COLOR_BUFFER_BIT, GL_NEAREST);
+-        last_xfb = dest;
+-        ++cnt.frames;
++        if (mid_mode) mid_xfb_made = true;
++        else {
++            last_xfb = dest;
++            ++cnt.frames;
++            frame_ended = true;
++        }
+     } else {                                                     // to a texture
+         bool half = v >> 9 & 1;
+         int tw = half ? (w + 1) / 2 : w, th = half ? (h + 1) / 2 : h;
+         uint32_t tpf = v >> 3 & 15, fmt = tpf / 2 + (tpf & 1) * 8;
+-        Tex& t = efb_copies[dest];
++        Tex& t = mid_mode ? mid_copies[dest] : efb_copies[dest];
+         ensure_tex(t, tw * S, th * S, 1);
+         glNamedFramebufferTexture(copy_fbo, GL_COLOR_ATTACHMENT0, t.name, 0);
+         glBindFramebuffer(GL_FRAMEBUFFER, copy_fbo);
+@@ -386,6 +447,37 @@ void bp_set(uint32_t v) {
  }
  
  // ---- draws --------------------------------------------------------------------------------------
@@ -71,7 +152,7 @@ index 80d48fd..d5fc72e 100644
  GLuint program_for(uint8_t vflags) {
      std::string key = gx_shader_key(bp, xf, vflags);
      auto it = programs.find(key);
-@@ -401,6 +456,7 @@ GLuint program_for(uint8_t vflags) {
+@@ -401,6 +493,7 @@ GLuint program_for(uint8_t vflags) {
      GLuint p = load_program(hash);
      if (p) ++cnt.cached;
      else if ((p = link(vs, fs))) { ++cnt.linked; save_program(p, hash); }
@@ -79,7 +160,332 @@ index 80d48fd..d5fc72e 100644
      programs_by_source.emplace(std::move(source), p);
      if (const char* dir = std::getenv("WIIKIT_SHADERDUMP")) {           // debugging: the sources
          std::string path = std::string(dir) + "/prog_" + std::to_string(cnt.programs) + ".glsl";
-@@ -862,6 +918,7 @@ constexpr uint32_t kStick = 1u << 16;               // L up, down, left, right,
+@@ -498,6 +591,8 @@ void bind_textures() {
+         if (map_src[m] >> 32) {
+             auto it = efb_copies.find((uint32_t)map_src[m]);
+             if (it != efb_copies.end()) name = it->second.name;
++            if (mid_mode)
++                if (auto mt = mid_copies.find((uint32_t)map_src[m]); mt != mid_copies.end()) name = mt->second.name;
+         } else {
+             auto it = texs.find((uint32_t)map_src[m]);
+             if (it != texs.end()) name = it->second.name;
+@@ -522,6 +617,119 @@ void bind_textures() {
+     }
+ }
+ 
++uint64_t mix64(uint64_t h, uint64_t v) {
++    h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
++    return h * 0xFF51AFD7ED558CCDull;
++}
++float f32(uint32_t w) { float f; std::memcpy(&f, &w, 4); return f; }
++uint32_t u32(float f) { uint32_t w; std::memcpy(&w, &f, 4); return w; }
++
++// The halfway frame's matrices: halfway between the frame before's (a, as
++// mid_matrices' layout: XI_POS words of matrix memory, XI_NRM of normal
++// matrices, the projection) and the current XF's; each matrix kept as it
++// is where the two are far apart. a null: the current ones.
++const uint32_t* mid_matrices(const uint32_t* a) {
++    static uint32_t out[XI_WORDS];
++    uint32_t* b = out;
++    std::memcpy(b, &xf[0], XI_POS * 4);
++    std::memcpy(b + XI_POS, &xf[0x400], XI_NRM * 4);
++    std::memcpy(b + XI_POS + XI_NRM, &xf[0x1020], XI_PRJ * 4);
++    if (!a) return out;
++    auto lerp = [&](uint32_t i) { b[i] = u32((f32(a[i]) + f32(b[i])) * 0.5f); };
++    auto finite = [](float v) { return v == v && std::fabs(v) < 1e30f; };
++    // 3x4 matrices, 12 words each (the position matrices on multiples of 3 rows; texture ones too, near enough)
++    for (uint32_t g = 0; g + 12 <= XI_POS; g += 12) {
++        float rs = 0, dr = 0, ta[3], tb[3];
++        bool ok = true;
++        for (int r = 0; r < 3; ++r) {
++            for (int c = 0; c < 3; ++c) {
++                float x = f32(a[g + r * 4 + c]), y = f32(b[g + r * 4 + c]);
++                ok = ok && finite(x) && finite(y);
++                rs = std::max(rs, std::fabs(y));
++                dr = std::max(dr, std::fabs(x - y));
++            }
++            ta[r] = f32(a[g + r * 4 + 3]);
++            tb[r] = f32(b[g + r * 4 + 3]);
++            ok = ok && finite(ta[r]) && finite(tb[r]);
++        }
++        if (!ok || dr > 0.35f * rs + 1e-6f) continue;
++        float dt = std::sqrt((ta[0] - tb[0]) * (ta[0] - tb[0]) + (ta[1] - tb[1]) * (ta[1] - tb[1]) + (ta[2] - tb[2]) * (ta[2] - tb[2]));
++        float tl = std::max(std::sqrt(ta[0] * ta[0] + ta[1] * ta[1] + ta[2] * ta[2]),
++                            std::sqrt(tb[0] * tb[0] + tb[1] * tb[1] + tb[2] * tb[2]));
++        if (dt > 0.35f * tl + 0.05f * rs) continue;
++        for (uint32_t i = g; i < g + 12; ++i) lerp(i);
++    }
++    for (uint32_t g = XI_POS; g + 9 <= XI_POS + XI_NRM; g += 9) {   // normal matrices, 3x3
++        float rs = 0, dr = 0;
++        for (uint32_t i = g; i < g + 9; ++i) {
++            rs = std::max(rs, std::fabs(f32(b[i])));
++            dr = std::max(dr, std::fabs(f32(a[i]) - f32(b[i])));
++        }
++        if (dr <= 0.35f * rs + 1e-6f) for (uint32_t i = g; i < g + 9; ++i) lerp(i);
++    }
++    uint32_t p = XI_POS + XI_NRM;                                  // the projection, of one kind in both
++    if (a[p + 6] == b[p + 6]) {
++        float rs = 0, dr = 0;
++        for (uint32_t i = p; i < p + 6; ++i) {
++            rs = std::max(rs, std::fabs(f32(b[i])));
++            dr = std::max(dr, std::fabs(f32(a[i]) - f32(b[i])));
++        }
++        if (dr <= 0.25f * rs) for (uint32_t i = p; i < p + 6; ++i) lerp(i);
++    }
++    return out;
++}
++
++// The halfway frame's vertices: positions, normals, texture coordinates and
++// colours halfway, where the
++// draw's vertices moved on the CPU and not too far for its size.
++bool mid_vertices(const uint8_t* a, const uint8_t* b, uint32_t npieces, std::vector<uint8_t>& out) {
++    size_t len = 0;
++    for (uint32_t i = 0, k; i < npieces; ++i) {
++        std::memcpy(&k, b + len, 4);
++        len += 4 + (size_t)k * sizeof(GVtx);
++    }
++    if (!std::memcmp(a, b, len)) return false;                   // nothing moved
++    float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f}, d = 0;
++    for (size_t off = 0, i = 0; i < npieces; ++i) {
++        uint32_t k, ka;
++        std::memcpy(&k, b + off, 4);
++        std::memcpy(&ka, a + off, 4);
++        if (k != ka) return false;
++        off += 4;
++        for (uint32_t v = 0; v < k; ++v, off += sizeof(GVtx)) {
++            const GVtx *va = reinterpret_cast<const GVtx*>(a + off), *vb = reinterpret_cast<const GVtx*>(b + off);
++            if (std::memcmp(va->mtx, vb->mtx, sizeof vb->mtx)) return false;
++            for (int c = 0; c < 3; ++c) {
++                lo[c] = std::min(lo[c], vb->pos[c]);
++                hi[c] = std::max(hi[c], vb->pos[c]);
++                d = std::max(d, std::fabs(va->pos[c] - vb->pos[c]));
++            }
++        }
++    }
++    float size = std::max({hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]});
++    if (!(d <= 2.0f * size)) return false;                     // a jump (a particle born again): not lerped
++    out.assign(b, b + len);
++    for (size_t off = 0, i = 0; i < npieces; ++i) {
++        uint32_t k;
++        std::memcpy(&k, b + off, 4);
++        off += 4;
++        for (uint32_t v = 0; v < k; ++v, off += sizeof(GVtx)) {
++            const GVtx* va = reinterpret_cast<const GVtx*>(a + off);
++            GVtx* vo = reinterpret_cast<GVtx*>(out.data() + off);
++            for (int c = 0; c < 3; ++c) {
++                vo->pos[c] = (va->pos[c] + vo->pos[c]) * 0.5f;
++                vo->nrm[c] = (va->nrm[c] + vo->nrm[c]) * 0.5f;
++            }
++            for (int t = 0; t < 8; ++t)                      // scrolled texture coordinates, not ones that wrapped
++                for (int c = 0; c < 2; ++c)
++                    if (std::fabs(va->tc[t][c] - vo->tc[t][c]) < 0.25f) vo->tc[t][c] = (va->tc[t][c] + vo->tc[t][c]) * 0.5f;
++            for (int k = 0; k < 2; ++k)
++                for (int c = 0; c < 4; ++c) vo->col[k][c] = (uint8_t)((va->col[k][c] + vo->col[k][c] + 1) / 2);
++        }
++    }
++    return true;
++}
++
+ // A VC_DRAW's pieces (each n, then n vertices), drawn with one call.
+ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces) {
+     uint32_t n = 0;
+@@ -530,6 +738,51 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
+         std::memcpy(&k, pieces + (size_t)n * sizeof(GVtx) + 4 * i, 4);
+         n += k;
+     }
++    const uint32_t* lerp_xf = nullptr;                         // the halfway frame: its matrices
++    if (opt.interpolate) {
++        uint64_t loose = mix64(prim, vflags);
++        uint32_t used = used_maps();
++        for (int m = 0; m < 8; ++m)
++            if (used >> m & 1) loose = mix64(loose, map_src[m] + (uint64_t)m * 0x9E37);
++        if (n) loose = mix64(loose, reinterpret_cast<const GVtx*>(vtx)->mtx[0]);
++        uint64_t key = mix64(loose, (uint64_t)n << 32 | npieces);
++        size_t len = (size_t)n * sizeof(GVtx) + 4 * npieces;
++        if (!mid_mode) {
++            fr_cur.draws.push_back({key, loose, fr_cur.stream.size() + (size_t)(pieces - cmd_start), len});
++            size_t at = fr_cur.xfs.size();
++            fr_cur.xfs.resize(at + XI_WORDS);
++            std::memcpy(&fr_cur.xfs[at], &xf[0], XI_POS * 4);
++            std::memcpy(&fr_cur.xfs[at + XI_POS], &xf[0x400], XI_NRM * 4);
++            std::memcpy(&fr_cur.xfs[at + XI_POS + XI_NRM], &xf[0x1020], XI_PRJ * 4);
++        } else {
++            ++ist.draws;
++            const DrawRec* a = nullptr;
++            bool full = false;
++            uint32_t ko = occ_key[key]++, lo = occ_loose[loose]++;
++            if (auto it = prev_by_key.find(key); it != prev_by_key.end() && ko < it->second.size())
++                a = &fr_prev.draws[it->second[ko]], full = true;
++            else if (auto jt = prev_by_loose.find(loose); jt != prev_by_loose.end() && lo < jt->second.size())
++                a = &fr_prev.draws[jt->second[lo]];
++            static std::vector<uint8_t> moved;
++            if (a) {
++                ++(full ? ist.matched : ist.loose);
++                lerp_xf = mid_matrices(&fr_prev.xfs[(size_t)(a - fr_prev.draws.data()) * XI_WORDS]);
++                if (full && a->vtx_len == len && mid_vertices(fr_prev.stream.data() + a->vtx_at, pieces, npieces, moved)) {
++                    ++ist.vtx;
++                    pieces = moved.data();
++                    vtx = pieces + 4;
++                }
++            }
++            if (!lerp_xf) lerp_xf = mid_matrices(nullptr);
++            static const char* dbg = std::getenv("WIIKIT_INTERPDEBUG");
++            if (dbg && (long)cnt.frames == std::atol(dbg)) {
++                uint32_t diff = 0;
++                for (uint32_t i = 0; i < XI_WORDS; ++i) diff += lerp_xf[i] != (i < XI_POS ? xf[i] : i < XI_POS + XI_NRM ? xf[0x400 + i - XI_POS] : xf[0x1020 + i - XI_POS - XI_NRM]);
++                rt_log("interp: draw prim %02X n %u key %016llx %s, %u words lerped, vtx %s, mtx0 %u", prim, n, (unsigned long long)key,
++                       a ? (full ? "matched" : "loose") : "new", diff, pieces == moved.data() ? "moved" : "kept", n ? reinterpret_cast<const GVtx*>(vtx)->mtx[0] : 0);
++            }
++        }
++    }
+     uint32_t cull = bp[0x00] >> 14 & 3;
+     bool tri = prim < 0xA8;
+     if (tri && cull == 3) return;
+@@ -596,6 +849,11 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
+         xf_lo = 0x1058;
+         xf_hi = 0;
+     }
++    if (lerp_xf) {
++        glNamedBufferSubData(xf_ubo, 0, XI_POS * 4, lerp_xf);
++        glNamedBufferSubData(xf_ubo, 0x400 * 4, XI_NRM * 4, lerp_xf + XI_POS);
++        glNamedBufferSubData(xf_ubo, 0x1020 * 4, XI_PRJ * 4, lerp_xf + XI_POS + XI_NRM);
++    }
+     set_ps_uniforms();
+     bind_textures();
+ 
+@@ -722,10 +980,12 @@ void copy_readback(uint32_t addr) {
+     rb_cv.notify_all();
+ }
+ 
+-void exec(const std::vector<uint8_t>& data) {
+-    const uint8_t* p = data.data();
+-    const uint8_t* end = p + data.size();
++void interp_frame_end();
++
++void exec_bytes(const uint8_t* p, size_t size) {
++    const uint8_t* end = p + size;
+     while (p < end) {
++        cmd_start = p;
+         switch (*p++) {
+         case VC_BP: bp_set(rd<uint32_t>(p)); break;
+         case VC_XF: {
+@@ -751,10 +1011,10 @@ void exec(const std::vector<uint8_t>& data) {
+             uint32_t id = rd<uint32_t>(p);
+             int w = rd<uint16_t>(p), h = rd<uint16_t>(p), levels = rd<uint8_t>(p);
+             Tex& t = texs[id];
+-            ensure_tex(t, w, h, levels);
++            if (!mid_mode) ensure_tex(t, w, h, levels);              // the halfway frame: uploaded already
+             for (int l = 0; l < levels; ++l) {
+                 int lw = std::max(1, w >> l), lh = std::max(1, h >> l);
+-                glTextureSubImage2D(t.name, l, 0, 0, lw, lh, GL_RGBA, GL_UNSIGNED_BYTE, p);
++                if (!mid_mode) glTextureSubImage2D(t.name, l, 0, 0, lw, lh, GL_RGBA, GL_UNSIGNED_BYTE, p);
+                 p += (size_t)lw * lh * 4;
+             }
+             map_src[m] = id;
+@@ -763,10 +1023,101 @@ void exec(const std::vector<uint8_t>& data) {
+         case VC_TEXBIND: { uint8_t m = rd<uint8_t>(p); map_src[m] = rd<uint32_t>(p); break; }
+         case VC_TEXEFB: { uint8_t m = rd<uint8_t>(p); map_src[m] = 1ull << 32 | rd<uint32_t>(p); break; }
+         case VC_FRAME: break;
+-        case VC_DRAWDONE: gx_draw_done_reached(); break;
++        case VC_DRAWDONE: if (!mid_mode) gx_draw_done_reached(); break;
+         default: rt_die("video: bad record byte %02X", p[-1]);
+         }
++        if (opt.interpolate && !mid_mode) {
++            fr_cur.stream.insert(fr_cur.stream.end(), cmd_start, p);
++            if (frame_ended) {
++                frame_ended = false;
++                interp_frame_end();
++            }
++        }
++    }
++}
++
++void exec(const std::vector<uint8_t>& data) { exec_bytes(data.data(), data.size()); }
++
++void state_save(GXState& s) {
++    std::memcpy(s.bp, bp, sizeof bp);
++    std::memcpy(s.xf, xf, sizeof xf);
++    std::memcpy(s.reg, tev_reg, sizeof tev_reg);
++    std::memcpy(s.konst, tev_konst, sizeof tev_konst);
++    std::memcpy(s.maps, map_src, sizeof map_src);
++}
++void state_load(const GXState& s) {
++    std::memcpy(bp, s.bp, sizeof bp);
++    std::memcpy(xf, s.xf, sizeof xf);
++    std::memcpy(tev_reg, s.reg, sizeof tev_reg);
++    std::memcpy(tev_konst, s.konst, sizeof tev_konst);
++    std::memcpy(map_src, s.maps, sizeof map_src);
++    xf_lo = 0;
++    xf_hi = 0x1058;
++}
++
++// A frame complete (its XFB copy just made): its halfway frame drawn from
++// its record, then the record kept as the frame before.
++void interp_frame_end() {
++    uint32_t shown = last_xfb;
++    showq.clear();
++    if (st_start_ok && !fr_prev.draws.empty() && !fr_cur.draws.empty()) {
++        state_save(st_live);
++        state_load(st_start);
++        std::swap(efb_fbo, mid_fbo);
++        std::swap(efb_col, mid_col);
++        std::swap(efb_dep, mid_dep);
++        glBlitNamedFramebuffer(start_fbo, efb_fbo, 0, 0, EFB_W * S, EFB_H * S, 0, 0, EFB_W * S, EFB_H * S,
++                               GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_NEAREST);
++        occ_key.clear();
++        occ_loose.clear();
++        mid_mode = true;
++        mid_xfb_made = false;
++        exec_bytes(fr_cur.stream.data(), fr_cur.stream.size());
++        mid_mode = false;
++        std::swap(efb_fbo, mid_fbo);
++        std::swap(efb_col, mid_col);
++        std::swap(efb_dep, mid_dep);
++        state_load(st_live);
++        ps_valid = false;
++        ++ist.frames;
++        if (mid_xfb_made) showq.push_back({true, 0});
++        static const char* dump = std::getenv("WIIKIT_INTERPDUMP");    // debugging: DIR,FIRST,COUNT frames
++        if (dump) {
++            static std::string dir = std::string(dump).substr(0, std::string(dump).find(','));
++            static long first = 0, count = 8, stride = 1;
++            static bool parsed = (std::sscanf(std::strchr(dump, ',') ? std::strchr(dump, ',') + 1 : "0", "%ld,%ld,%ld", &first, &count, &stride), true);
++            (void)parsed;
++            long f = (long)cnt.frames;
++            auto save = [&](const Tex& t, const char* tag) {
++                std::vector<uint8_t> px((size_t)t.w * t.h * 4);
++                glGetTextureImage(t.name, 0, GL_RGBA, GL_UNSIGNED_BYTE, (GLsizei)px.size(), px.data());
++                char name[64];
++                std::snprintf(name, sizeof name, "/interp_%06ld_%s.png", f, tag);
++                write_png(dir + name, t.w, t.h, px.data());
++            };
++            if (f >= first && (f - first) / stride < count && (f - first) % stride == 0) {
++                if (auto it = xfbs.find(prev_shown); it != xfbs.end() && prev_shown != shown) save(it->second, "0_prev");
++                if (mid_xfb_made) save(mid_xfb, "a_mid");
++                if (auto it = xfbs.find(shown); it != xfbs.end()) save(it->second, "b_real");
++            }
++        }
++    }
++    showq.push_back({false, shown});
++    prev_shown = shown;
++    std::swap(fr_prev, fr_cur);
++    fr_cur.stream.clear();
++    fr_cur.draws.clear();
++    fr_cur.xfs.clear();
++    prev_by_key.clear();
++    prev_by_loose.clear();
++    for (uint32_t i = 0; i < fr_prev.draws.size(); ++i) {
++        prev_by_key[fr_prev.draws[i].key].push_back(i);
++        prev_by_loose[fr_prev.draws[i].loose].push_back(i);
+     }
++    state_save(st_start);                                      // the next frame starts from here
++    st_start_ok = true;
++    glBlitNamedFramebuffer(efb_fbo, start_fbo, 0, 0, EFB_W * S, EFB_H * S, 0, 0, EFB_W * S, EFB_H * S,
++                           GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+ }
+ 
+ // ---- presenting -----------------------------------------------------------------------------------
+@@ -862,6 +1213,7 @@ constexpr uint32_t kStick = 1u << 16;               // L up, down, left, right,
  std::vector<Binding> bindings;
  int keys_input = INPUT_MODE_AUTO;                        // the key file's Input
  bool face_by_label = false;                         // the key file's Face Buttons = Label
@@ -87,7 +493,7 @@ index 80d48fd..d5fc72e 100644
  float dead_zone = 0.15f;                            // the key file's Dead Zone: of the sticks' travel, radial
  
  const char* DEFAULT_KEYS =
-@@ -890,7 +947,8 @@ const char* DEFAULT_KEYS =
+@@ -890,7 +1242,8 @@ const char* DEFAULT_KEYS =
      "# wiiboot --input says the same).\n"
      "# The pad: its triggers are ZL and ZR, its shoulders L and R, Start +, Back -, its guide button Home.\n"
      "# Face Buttons = Position: the right one is A, the bottom one B, the top one X, the left one Y (the\n"
@@ -97,7 +503,7 @@ index 80d48fd..d5fc72e 100644
      "# Dead Zone: how far the pad's sticks move before they count, of their travel.\n"
      "Input        = Auto\n"
      "Face Buttons = Position\n"
-@@ -978,9 +1036,10 @@ bool parse_keys(const std::string& text, const std::string& path, bool remote, b
+@@ -978,9 +1331,10 @@ bool parse_keys(const std::string& text, const std::string& path, bool remote, b
                  continue;
              }
              if (SDL_strcasecmp(lhs.c_str(), "Face Buttons") == 0) {
@@ -111,7 +517,7 @@ index 80d48fd..d5fc72e 100644
                  continue;
              }
              if (SDL_strcasecmp(lhs.c_str(), "Dead Zone") == 0) {
-@@ -1107,6 +1166,7 @@ ClassicState classic_from_pad(SDL_Gamepad* g) {
+@@ -1107,6 +1461,7 @@ ClassicState classic_from_pad(SDL_Gamepad* g) {
      for (auto& f : face) {
          if (!SDL_GetGamepadButton(g, f.b)) continue;
          uint32_t bit = f.pos;
@@ -119,7 +525,62 @@ index 80d48fd..d5fc72e 100644
          if (face_by_label) switch (SDL_GetGamepadButtonLabel(g, f.b)) {
              case SDL_GAMEPAD_BUTTON_LABEL_A: case SDL_GAMEPAD_BUTTON_LABEL_CROSS: bit = CL_A; break;
              case SDL_GAMEPAD_BUTTON_LABEL_B: case SDL_GAMEPAD_BUTTON_LABEL_CIRCLE: bit = CL_B; break;
-@@ -1391,6 +1451,7 @@ void setup() {
+@@ -1295,10 +1650,26 @@ void present() {
+     glColorMask(1, 1, 1, 1);
+     glClearColor(0, 0, 0, 1);
+     glClear(GL_COLOR_BUFFER_BIT);
+-    auto it = xfbs.find(xfb_addr.load());
+-    if (it == xfbs.end()) it = xfbs.find(last_xfb);
+-    if (it != xfbs.end() && ww > 0 && wh > 0) {
+-        const Tex& t = it->second;
++    const Tex* shown = nullptr;
++    if (opt.interpolate) {                                       // the frames in their own order, one a retrace
++        if (!showq.empty()) {
++            showing = showq.front();
++            showq.pop_front();
++            showing_set = true;
++        }
++        if (showing_set && showing.first) shown = &mid_xfb;
++        else if (showing_set) {
++            auto it = xfbs.find(showing.second);
++            if (it != xfbs.end()) shown = &it->second;
++        }
++    }
++    if (!shown) {
++        auto it = xfbs.find(xfb_addr.load());
++        if (it == xfbs.end()) it = xfbs.find(last_xfb);
++        if (it != xfbs.end()) shown = &it->second;
++    }
++    if (shown && shown->name && ww > 0 && wh > 0) {
++        const Tex& t = *shown;
+         Rect r = picture_rect((float)ww, (float)wh);
+         int dx = (int)std::lround(r.x), dy = (int)std::lround(r.y);
+         int dw = (int)std::lround(r.w), dh = (int)std::lround(r.h);
+@@ -1337,6 +1708,23 @@ void setup() {
+     glNamedFramebufferTexture(efb_fbo, GL_DEPTH_ATTACHMENT, efb_dep, 0);
+     if (glCheckNamedFramebufferStatus(efb_fbo, GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+         rt_die("video: the EFB framebuffer is incomplete");
++    if (opt.interpolate) {
++        for (auto [fbo, col, dep] : {std::tuple<GLuint*, GLuint*, GLuint*>{&mid_fbo, &mid_col, &mid_dep},
++                                     {&start_fbo, &start_col, &start_dep}}) {
++            glCreateTextures(GL_TEXTURE_2D, 1, col);
++            glTextureStorage2D(*col, 1, GL_RGBA8, EFB_W * S, EFB_H * S);
++            glCreateTextures(GL_TEXTURE_2D, 1, dep);
++            glTextureStorage2D(*dep, 1, GL_DEPTH_COMPONENT32F, EFB_W * S, EFB_H * S);
++            for (GLuint t : {*col, *dep}) {
++                glTextureParameteri(t, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++                glTextureParameteri(t, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++            }
++            glCreateFramebuffers(1, fbo);
++            glNamedFramebufferTexture(*fbo, GL_COLOR_ATTACHMENT0, *col, 0);
++            glNamedFramebufferTexture(*fbo, GL_DEPTH_ATTACHMENT, *dep, 0);
++        }
++        rt_log("video: frame interpolation on: 60 frames a second shown from the game's 30");
++    }
+     glCreateFramebuffers(1, &copy_fbo);
+     glBindFramebuffer(GL_FRAMEBUFFER, efb_fbo);
+     glClearColor(0, 0, 0, 1);
+@@ -1391,6 +1779,7 @@ void setup() {
      if (!copy_prog) rt_die("video: the EFB copy program does not build");
      copy_rect_loc = glGetUniformLocation(copy_prog, "u_rect");
      copy_mode_loc = glGetUniformLocation(copy_prog, "u_mode");
@@ -127,3 +588,56 @@ index 80d48fd..d5fc72e 100644
  }
  
  }  // namespace
+@@ -1586,6 +1975,10 @@ void video_run(const char* title) {
+                    (unsigned long long)cnt.frames, (unsigned long long)cnt.presents,
+                    (unsigned long long)cnt.draws, (unsigned long long)cnt.programs,
+                    (unsigned long long)cnt.linked, (unsigned long long)cnt.cached);
++            if (opt.interpolate)
++                rt_log("video: %llu halfway frames: of %llu draws, %llu matched, %llu by kind only, %llu with vertices moved",
++                       (unsigned long long)ist.frames, (unsigned long long)ist.draws, (unsigned long long)ist.matched,
++                       (unsigned long long)ist.loose, (unsigned long long)ist.vtx);
+             gx_report();
+             std::fflush(stdout);
+             std::_Exit(0);
+diff --git a/runtime/video.h b/runtime/video.h
+index ecfb499..d2d73a8 100644
+--- a/runtime/video.h
++++ b/runtime/video.h
+@@ -67,6 +67,7 @@ struct VideoOptions {
+     int window_w = 0, window_h = 0;          // the window's size; 0 = 720 lines at the screen's shape
+     std::string keys;                        // the key file: the Remote's buttons on keys and mouse buttons
+     std::string shader_cache;                // a directory for linked programs' binaries; empty = none
++    bool interpolate = false;                // show 60 frames a second, every other one drawn halfway between the game's
+     int input = -1;                          // channel 1's sources, INPUT_MODE_* (windows.h has INPUT_*); -1: the key file's
+ };
+ enum { INPUT_MODE_AUTO, INPUT_MODE_PAD, INPUT_MODE_KEYBOARD };
+diff --git a/runtime/wiiboot.cpp b/runtime/wiiboot.cpp
+index 250d419..fe38027 100644
+--- a/runtime/wiiboot.cpp
++++ b/runtime/wiiboot.cpp
+@@ -1,7 +1,7 @@
+ // wiiboot — run a recompiled Wii or GameCube disc game.
+ //
+ //     wiiboot EXTRACT_DIR [--nand DIR] [--fonts DIR] [--symbols symbols.tsv] [--mmio-log] [--watch SECONDS]
+-//                         [--no-video] [--no-audio] [--scale N] [--frames-ahead N] [--dump DIR]
++//                         [--no-video] [--no-audio] [--scale N] [--interpolate] [--frames-ahead N] [--dump DIR]
+ //                         [--dump-every N] [--quit-after SECONDS] [--aspect 16:9|4:3]
+ //                         [--language en|fr|es|de|it|nl|ja] [--fullscreen] [--window WxH] [--keys FILE]
+ //                         [--input auto|pad|keyboard]
+@@ -40,7 +40,7 @@ int main(int argc, char** argv) {
+     if (argc < 2) {
+         std::fprintf(stderr, "usage: wiiboot EXTRACT_DIR [--nand DIR] [--fonts DIR] [--symbols symbols.tsv] "
+                              "[--mmio-log] [--watch SECONDS]\n"
+-                             "                            [--no-video] [--no-audio] [--scale N] [--frames-ahead N] "
++                             "                            [--no-video] [--no-audio] [--scale N] [--interpolate] [--frames-ahead N] "
+                              "[--dump DIR] [--dump-every N] [--quit-after SECONDS]\n"
+                              "                            [--aspect 16:9|4:3] [--language en|fr|es|de|it|nl|ja] "
+                              "[--fullscreen] [--window WxH] [--keys FILE]\n"
+@@ -61,6 +61,7 @@ int main(int argc, char** argv) {
+         else if (!std::strcmp(argv[i], "--no-video")) vo.enabled = false;
+         else if (!std::strcmp(argv[i], "--no-audio")) audio = false;
+         else if (!std::strcmp(argv[i], "--scale") && i + 1 < argc) vo.scale = std::atoi(argv[++i]);
++        else if (!std::strcmp(argv[i], "--interpolate")) vo.interpolate = true;
+         else if (!std::strcmp(argv[i], "--frames-ahead") && i + 1 < argc) vo.frames_ahead = std::max(1, std::atoi(argv[++i]));
+         else if (!std::strcmp(argv[i], "--dump") && i + 1 < argc) vo.dump_dir = argv[++i];
+         else if (!std::strcmp(argv[i], "--dump-every") && i + 1 < argc) vo.dump_every = std::max(1, std::atoi(argv[++i]));
