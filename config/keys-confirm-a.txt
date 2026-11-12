@@ -26,7 +26,7 @@ Shake = Space, Mouse Middle
 # Classic's own layout); Label: the button labelled A (Cross) is A, B (Circle) B, X (Square) X, Y (Triangle) Y.
 # Dead Zone: how far the pad's sticks move before they count, of their travel.
 Input        = Auto
-Face Buttons = Label
+Face Buttons = Bottom A
 Dead Zone    = 0.15
 A     = Return, Space
 B     = Backspace, C

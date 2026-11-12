@@ -1,5 +1,5 @@
 diff --git a/runtime/video.cpp b/runtime/video.cpp
-index 80d48fd..141acd5 100644
+index 80d48fd..d5fc72e 100644
 --- a/runtime/video.cpp
 +++ b/runtime/video.cpp
 @@ -225,6 +225,30 @@ void save_program(GLuint p, uint64_t hash) {
@@ -79,7 +79,47 @@ index 80d48fd..141acd5 100644
      programs_by_source.emplace(std::move(source), p);
      if (const char* dir = std::getenv("WIIKIT_SHADERDUMP")) {           // debugging: the sources
          std::string path = std::string(dir) + "/prog_" + std::to_string(cnt.programs) + ".glsl";
-@@ -1391,6 +1447,7 @@ void setup() {
+@@ -862,6 +918,7 @@ constexpr uint32_t kStick = 1u << 16;               // L up, down, left, right,
+ std::vector<Binding> bindings;
+ int keys_input = INPUT_MODE_AUTO;                        // the key file's Input
+ bool face_by_label = false;                         // the key file's Face Buttons = Label
++bool face_a_bottom = false;                         // Face Buttons = Bottom A: A and B by label, X and Y by position
+ float dead_zone = 0.15f;                            // the key file's Dead Zone: of the sticks' travel, radial
+ 
+ const char* DEFAULT_KEYS =
+@@ -890,7 +947,8 @@ const char* DEFAULT_KEYS =
+     "# wiiboot --input says the same).\n"
+     "# The pad: its triggers are ZL and ZR, its shoulders L and R, Start +, Back -, its guide button Home.\n"
+     "# Face Buttons = Position: the right one is A, the bottom one B, the top one X, the left one Y (the\n"
+-    "# Classic's own layout); Label: the button labelled A (Cross) is A, B (Circle) B, X (Square) X, Y (Triangle) Y.\n"
++    "# Classic's own layout); Label: the button labelled A (Cross) is A, B (Circle) B, X (Square) X, Y (Triangle) Y;\n"
++    "# Bottom A: the bottom one is A and the right one B, the top one X and the left one Y.\n"
+     "# Dead Zone: how far the pad's sticks move before they count, of their travel.\n"
+     "Input        = Auto\n"
+     "Face Buttons = Position\n"
+@@ -978,9 +1036,10 @@ bool parse_keys(const std::string& text, const std::string& path, bool remote, b
+                 continue;
+             }
+             if (SDL_strcasecmp(lhs.c_str(), "Face Buttons") == 0) {
+-                if (SDL_strcasecmp(rest.c_str(), "Label") == 0) face_by_label = true;
+-                else if (SDL_strcasecmp(rest.c_str(), "Position") == 0) face_by_label = false;
+-                else rt_log("video: %s:%d: Face Buttons is Position or Label", path.c_str(), line);
++                if (SDL_strcasecmp(rest.c_str(), "Label") == 0) face_by_label = true, face_a_bottom = false;
++                else if (SDL_strcasecmp(rest.c_str(), "Position") == 0) face_by_label = false, face_a_bottom = false;
++                else if (SDL_strcasecmp(rest.c_str(), "Bottom A") == 0) face_by_label = false, face_a_bottom = true;
++                else rt_log("video: %s:%d: Face Buttons is Position, Label or Bottom A", path.c_str(), line);
+                 continue;
+             }
+             if (SDL_strcasecmp(lhs.c_str(), "Dead Zone") == 0) {
+@@ -1107,6 +1166,7 @@ ClassicState classic_from_pad(SDL_Gamepad* g) {
+     for (auto& f : face) {
+         if (!SDL_GetGamepadButton(g, f.b)) continue;
+         uint32_t bit = f.pos;
++        if (face_a_bottom && (bit == CL_A || bit == CL_B)) bit = bit == CL_A ? CL_B : CL_A;   // the bottom one confirms
+         if (face_by_label) switch (SDL_GetGamepadButtonLabel(g, f.b)) {
+             case SDL_GAMEPAD_BUTTON_LABEL_A: case SDL_GAMEPAD_BUTTON_LABEL_CROSS: bit = CL_A; break;
+             case SDL_GAMEPAD_BUTTON_LABEL_B: case SDL_GAMEPAD_BUTTON_LABEL_CIRCLE: bit = CL_B; break;
+@@ -1391,6 +1451,7 @@ void setup() {
      if (!copy_prog) rt_die("video: the EFB copy program does not build");
      copy_rect_loc = glGetUniformLocation(copy_prog, "u_rect");
      copy_mode_loc = glGetUniformLocation(copy_prog, "u_mode");
