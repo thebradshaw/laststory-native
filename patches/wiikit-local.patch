@@ -1,5 +1,80 @@
+diff --git a/runtime/gx.cpp b/runtime/gx.cpp
+index f3b4379..bcc7f4c 100644
+--- a/runtime/gx.cpp
++++ b/runtime/gx.cpp
+@@ -263,7 +263,7 @@ void bind_map(int m) {
+         size_t at = rec.size();
+         for (int l = 0; l < levels; ++l) {
+             int lw = std::max(1, w >> l), lh = std::max(1, h >> l);
+-            gxtex_decode(fmt, lw, lh, s, grow((size_t)lw * lh * 4), pal, tfmt);
++            gxtex_decode_parallel(fmt, lw, lh, s, grow((size_t)lw * lh * 4), pal, tfmt);
+             s += gxtex_size(fmt, lw, lh);
+         }
+         static const char* dump = std::getenv("WIIKIT_TEXDUMP");     // debugging: uploads as PNGs
+diff --git a/runtime/gxtex.cpp b/runtime/gxtex.cpp
+index f83b89b..747fa99 100644
+--- a/runtime/gxtex.cpp
++++ b/runtime/gxtex.cpp
+@@ -6,7 +6,10 @@
+ // the hardware (wiikit.gxtex): I4 and I8 put the intensity in alpha too, and
+ // CMPR weights its interpolated colours 5/8 and 3/8, not 1/3 and 2/3.
+ #include "gxtex.h"
++#include <algorithm>
+ #include <cstring>
++#include <thread>
++#include <vector>
+ 
+ namespace {
+ 
+@@ -62,7 +65,7 @@ void gxtex_decode(uint32_t fmt, int w, int h, const uint8_t* s, uint8_t* out, co
+                   uint32_t tfmt) {
+     Block b = block(fmt);
+     auto px = [&](int x, int y) -> uint8_t* {
+-        static uint8_t sink[4];
++        thread_local uint8_t sink[4];
+         return x < w && y < h ? out + ((size_t)y * w + x) * 4 : sink;
+     };
+     for (int by = 0; by < h; by += b.h) {
+@@ -153,3 +156,26 @@ void gxtex_decode(uint32_t fmt, int w, int h, const uint8_t* s, uint8_t* out, co
+         }
+     }
+ }
++
++// Large textures in bands of tile rows, side by side: the rows of tiles
++// are independent, and a level of a big texture decodes in a fraction of
++// the time on the game's thread (loading hitches).
++void gxtex_decode_parallel(uint32_t fmt, int w, int h, const uint8_t* src, uint8_t* rgba, const uint8_t* tlut,
++                           uint32_t tlut_fmt) {
++    static const int workers = (int)std::clamp(std::thread::hardware_concurrency(), 1u, 8u);
++    Block b = block(fmt);
++    int tile_rows = (h + b.h - 1) / b.h, tiles_wide = (w + b.w - 1) / b.w;
++    int bands = std::min(workers, tile_rows);
++    if (bands < 2 || (size_t)w * h < 256 * 256) { gxtex_decode(fmt, w, h, src, rgba, tlut, tlut_fmt); return; }
++    int per = (tile_rows + bands - 1) / bands;
++    std::vector<std::thread> threads;
++    auto band = [=](int k) {
++        int r0 = k * per, r1 = std::min(tile_rows, r0 + per);
++        if (r0 >= r1) return;
++        int y0 = r0 * b.h, hh = std::min(h, r1 * b.h) - y0;
++        gxtex_decode(fmt, w, hh, src + (size_t)r0 * tiles_wide * b.bytes, rgba + (size_t)y0 * w * 4, tlut, tlut_fmt);
++    };
++    for (int k = 1; k < bands; ++k) threads.emplace_back(band, k);
++    band(0);
++    for (auto& t : threads) t.join();
++}
+diff --git a/runtime/gxtex.h b/runtime/gxtex.h
+index 7cd1d81..c391997 100644
+--- a/runtime/gxtex.h
++++ b/runtime/gxtex.h
+@@ -12,3 +12,6 @@ int gxtex_ci_entries(uint32_t fmt);                // palette entries a CI forma
+ // Decode one level; `tlut` (big-endian 16-bit entries) for the CI formats.
+ void gxtex_decode(uint32_t fmt, int w, int h, const uint8_t* src, uint8_t* rgba,
+                   const uint8_t* tlut = nullptr, uint32_t tlut_fmt = 0);
++// The same, large textures split over a few threads.
++void gxtex_decode_parallel(uint32_t fmt, int w, int h, const uint8_t* src, uint8_t* rgba,
++                           const uint8_t* tlut = nullptr, uint32_t tlut_fmt = 0);
 diff --git a/runtime/video.cpp b/runtime/video.cpp
-index 80d48fd..72d1292 100644
+index 80d48fd..aabc8cb 100644
 --- a/runtime/video.cpp
 +++ b/runtime/video.cpp
 @@ -18,6 +18,7 @@
@@ -20,7 +95,15 @@ index 80d48fd..72d1292 100644
  #include <vector>
  
  #define WIIKIT_GL_DEFINE(T, n) T n = nullptr;
-@@ -114,6 +117,47 @@ std::unordered_map<std::string, GLuint> programs_by_source;
+@@ -52,6 +55,7 @@ std::condition_variable q_space;
+ std::deque<Chunk> q;
+ std::vector<std::vector<uint8_t>> spare;           // record buffers to reuse (under qmx)
+ int q_frames = 0;
++int exec_frames = 0;                                // the frames of the chunk being executed (still in q_frames)
+ SDL_Semaphore* wake = nullptr;
+ std::atomic<uint32_t> xfb_addr{0}, retraces{0}, vi_lines{480};
+ // an EFB read-back asked for by the CPU (video_efb_read), done in the queue's order
+@@ -114,6 +118,53 @@ std::unordered_map<std::string, GLuint> programs_by_source;
  struct Counters { uint64_t frames, presents, draws, programs, linked, cached; } cnt;
  bool dump_ps = false;                              // WIIKIT_SHADERDUMP: log the next uniforms
  
@@ -48,6 +131,12 @@ index 80d48fd..72d1292 100644
 +GXState st_start, st_live;
 +std::unordered_map<uint32_t, Tex> mid_copies;      // the halfway frame's EFB copies
 +std::unordered_set<uint32_t> mid_copies_made;      // made in this halfway frame (others: the real frames')
++// each EFB copy as the frame began, kept aside when the frame first copies
++// over it: what the halfway frame reads before it makes its own (a glow the
++// game copies at the end of a frame for the next would else be read a
++// frame ahead, and every other halfway frame flickered dimmer)
++std::unordered_map<uint32_t, Tex> start_copies;
++std::unordered_set<uint32_t> start_copies_kept;
 +Tex mid_xfb;
 +// The frames to show, one a retrace, in order: copies in a ring of their
 +// own (the game reuses its XFBs, and the next halfway frame is drawn
@@ -61,14 +150,14 @@ index 80d48fd..72d1292 100644
 +bool mid_mode = false, frame_ended = false, mid_xfb_made = false;
 +const uint8_t* cmd_start = nullptr;                // the command being executed
 +GLuint mid_fbo, mid_col, mid_dep, start_fbo, start_col, start_dep;
-+struct InterpStats { uint64_t frames, draws, matched, loose, vtx, repeats, dropped, shown, camera; } ist;
++struct InterpStats { uint64_t frames, draws, matched, loose, vtx, repeats, dropped, shown, camera, busy; } ist;
 +float cam_delta[12];                               // the camera's move from this frame to the one before (static scenery's)
 +bool cam_ok = false;
 +
  int32_t s11(uint32_t v) { return (int32_t)((v & 0x7FF) << 21) >> 21; }
  int32_t s10(uint32_t v) { return (int32_t)((v & 0x3FF) << 22) >> 22; }
  float fx(uint32_t a) { float f; std::memcpy(&f, &xf[a], 4); return f; }
-@@ -204,17 +248,31 @@ GLuint load_program(uint64_t hash) {
+@@ -204,17 +255,31 @@ GLuint load_program(uint64_t hash) {
      glProgramBinary(p, format, data.data() + 4, (GLsizei)(data.size() - 4));
      GLint ok = 0;
      glGetProgramiv(p, GL_LINK_STATUS, &ok);
@@ -103,7 +192,7 @@ index 80d48fd..72d1292 100644
      std::vector<uint8_t> data(4 + (size_t)len);
      GLenum format = 0;
      glGetProgramBinary(p, len, nullptr, &format, data.data() + 4);
-@@ -225,6 +283,30 @@ void save_program(GLuint p, uint64_t hash) {
+@@ -225,6 +290,30 @@ void save_program(GLuint p, uint64_t hash) {
      }
  }
  
@@ -134,7 +223,7 @@ index 80d48fd..72d1292 100644
  void ensure_tex(Tex& t, int w, int h, int levels) {
      if (t.name && t.w == w && t.h == h && t.levels == levels) return;
      if (t.name) glDeleteTextures(1, &t.name);
-@@ -332,24 +414,29 @@ void efb_copy(uint32_t v) {
+@@ -332,24 +421,33 @@ void efb_copy(uint32_t v) {
      int w = (int)(bp[0x4A] & 0x3FF) + 1, h = (int)(bp[0x4A] >> 10 & 0x3FF) + 1;
      uint32_t dest = (bp[0x4B] & 0xFFFFFF) << 5;
      glDisable(GL_SCISSOR_TEST);
@@ -165,11 +254,15 @@ index 80d48fd..72d1292 100644
          uint32_t tpf = v >> 3 & 15, fmt = tpf / 2 + (tpf & 1) * 8;
 -        Tex& t = efb_copies[dest];
 +        if (mid_mode) mid_copies_made.insert(dest);
++        if (static const char* dbg = std::getenv("WIIKIT_INTERPDEBUG"); dbg && std::atol(dbg) <= (long)cnt.frames)
++            rt_log("interp: %s copy %08X %dx%d at %d,%d", mid_mode ? "mid" : "real", dest, w, h, x, y);
++        else if (opt.interpolate && efb_copies.count(dest) && start_copies_kept.insert(dest).second)
++            std::swap(efb_copies[dest], start_copies[dest]);    // the old one kept, its texture reused
 +        Tex& t = mid_mode ? mid_copies[dest] : efb_copies[dest];
          ensure_tex(t, tw * S, th * S, 1);
          glNamedFramebufferTexture(copy_fbo, GL_COLOR_ATTACHMENT0, t.name, 0);
          glBindFramebuffer(GL_FRAMEBUFFER, copy_fbo);
-@@ -386,6 +473,37 @@ void bp_set(uint32_t v) {
+@@ -386,6 +484,37 @@ void bp_set(uint32_t v) {
  }
  
  // ---- draws --------------------------------------------------------------------------------------
@@ -207,7 +300,7 @@ index 80d48fd..72d1292 100644
  GLuint program_for(uint8_t vflags) {
      std::string key = gx_shader_key(bp, xf, vflags);
      auto it = programs.find(key);
-@@ -401,6 +519,7 @@ GLuint program_for(uint8_t vflags) {
+@@ -401,6 +530,7 @@ GLuint program_for(uint8_t vflags) {
      GLuint p = load_program(hash);
      if (p) ++cnt.cached;
      else if ((p = link(vs, fs))) { ++cnt.linked; save_program(p, hash); }
@@ -215,16 +308,19 @@ index 80d48fd..72d1292 100644
      programs_by_source.emplace(std::move(source), p);
      if (const char* dir = std::getenv("WIIKIT_SHADERDUMP")) {           // debugging: the sources
          std::string path = std::string(dir) + "/prog_" + std::to_string(cnt.programs) + ".glsl";
-@@ -498,6 +617,8 @@ void bind_textures() {
+@@ -498,6 +628,11 @@ void bind_textures() {
          if (map_src[m] >> 32) {
              auto it = efb_copies.find((uint32_t)map_src[m]);
              if (it != efb_copies.end()) name = it->second.name;
-+            if (mid_mode)
-+                if (mid_copies_made.count((uint32_t)map_src[m])) name = mid_copies[(uint32_t)map_src[m]].name;
++            if (mid_mode) {
++                uint32_t a = (uint32_t)map_src[m];
++                if (mid_copies_made.count(a)) name = mid_copies[a].name;
++                else if (start_copies_kept.count(a)) name = start_copies[a].name;
++            }
          } else {
              auto it = texs.find((uint32_t)map_src[m]);
              if (it != texs.end()) name = it->second.name;
-@@ -522,6 +643,202 @@ void bind_textures() {
+@@ -522,6 +657,202 @@ void bind_textures() {
      }
  }
  
@@ -427,7 +523,7 @@ index 80d48fd..72d1292 100644
  // A VC_DRAW's pieces (each n, then n vertices), drawn with one call.
  void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces) {
      uint32_t n = 0;
-@@ -530,6 +847,71 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
+@@ -530,6 +861,80 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
          std::memcpy(&k, pieces + (size_t)n * sizeof(GVtx) + 4 * i, 4);
          n += k;
      }
@@ -474,7 +570,11 @@ index 80d48fd..72d1292 100644
 +            if (a) {
 +                ++(full ? ist.matched : ist.loose);
 +                lerp_xf = mid_matrices(&fr_prev.xfs[(size_t)(a - fr_prev.draws.data()) * XI_WORDS]);
-+                if (a->vtx_len == len && mid_vertices(fr_prev.stream.data() + a->vtx_at, pieces, npieces, moved)) {
++                // glowing effects (fire, sparks: added on) matched only by
++                // kind: often another particle of the same effect, whose
++                // halfway shape and colour came out dimmer than both frames
++                bool additive = (bp[0x41] & 1) && !(bp[0x41] >> 11 & 1) && (bp[0x41] >> 5 & 7) == 1;
++                if (!(additive && !full) && a->vtx_len == len && mid_vertices(fr_prev.stream.data() + a->vtx_at, pieces, npieces, moved)) {
 +                    ++ist.vtx;
 +                    pieces = moved.data();
 +                    vtx = pieces + 4;
@@ -488,18 +588,23 @@ index 80d48fd..72d1292 100644
 +                }
 +            }
 +            static const char* dbg = std::getenv("WIIKIT_INTERPDEBUG");
-+            if (dbg && (long)cnt.frames == std::atol(dbg)) {
++            static long dbg_a = dbg ? std::atol(dbg) : -1, dbg_b = dbg && std::strchr(dbg, ',') ? std::atol(std::strchr(dbg, ',') + 1) : dbg_a;
++            if (dbg && (long)cnt.frames >= dbg_a && (long)cnt.frames <= dbg_b) {
 +                uint32_t diff = 0;
 +                for (uint32_t i = 0; i < XI_WORDS; ++i) diff += lerp_xf[i] != (i < XI_POS ? xf[i] : i < XI_POS + XI_NRM ? xf[0x400 + i - XI_POS] : xf[0x1020 + i - XI_POS - XI_NRM]);
-+                rt_log("interp: draw prim %02X n %u key %016llx %s, %u words lerped, vtx %s, mtx0 %u", prim, n, (unsigned long long)key,
-+                       a ? (full ? "matched" : "loose") : "new", diff, pieces == moved.data() ? "moved" : "kept", n ? reinterpret_cast<const GVtx*>(vtx)->mtx[0] : 0);
++                char maps[96] = "";
++                for (int m = 0, at = 0; m < 8; ++m)
++                    if (used >> m & 1)
++                        at += std::snprintf(maps + at, sizeof maps - at, " %s%08X", map_src[m] >> 32 ? (mid_copies_made.count((uint32_t)map_src[m]) ? "m:" : start_copies_kept.count((uint32_t)map_src[m]) ? "s:" : "c:") : "", (uint32_t)map_src[m]);
++                rt_log("interp: f%ld draw prim %02X n %u key %016llx %s, %u words lerped, vtx %s, mtx0 %u, blend %06X z %02X maps%s", (long)cnt.frames, prim, n, (unsigned long long)key,
++                       a ? (full ? "matched" : "loose") : "new", diff, pieces == moved.data() ? "moved" : "kept", n ? reinterpret_cast<const GVtx*>(vtx)->mtx[0] : 0, bp[0x41], bp[0x40], maps);
 +            }
 +        }
 +    }
      uint32_t cull = bp[0x00] >> 14 & 3;
      bool tri = prim < 0xA8;
      if (tri && cull == 3) return;
-@@ -591,11 +973,37 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
+@@ -591,11 +996,37 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
      if (tri && cull) { glEnable(GL_CULL_FACE); glCullFace(cull == 1 ? GL_BACK : GL_FRONT); }
      else glDisable(GL_CULL_FACE);
  
@@ -537,7 +642,7 @@ index 80d48fd..72d1292 100644
      set_ps_uniforms();
      bind_textures();
  
-@@ -722,10 +1130,12 @@ void copy_readback(uint32_t addr) {
+@@ -722,10 +1153,12 @@ void copy_readback(uint32_t addr) {
      rb_cv.notify_all();
  }
  
@@ -553,7 +658,7 @@ index 80d48fd..72d1292 100644
          switch (*p++) {
          case VC_BP: bp_set(rd<uint32_t>(p)); break;
          case VC_XF: {
-@@ -751,10 +1161,14 @@ void exec(const std::vector<uint8_t>& data) {
+@@ -751,10 +1184,14 @@ void exec(const std::vector<uint8_t>& data) {
              uint32_t id = rd<uint32_t>(p);
              int w = rd<uint16_t>(p), h = rd<uint16_t>(p), levels = rd<uint8_t>(p);
              Tex& t = texs[id];
@@ -570,7 +675,7 @@ index 80d48fd..72d1292 100644
                  p += (size_t)lw * lh * 4;
              }
              map_src[m] = id;
-@@ -763,10 +1177,123 @@ void exec(const std::vector<uint8_t>& data) {
+@@ -763,12 +1200,135 @@ void exec(const std::vector<uint8_t>& data) {
          case VC_TEXBIND: { uint8_t m = rd<uint8_t>(p); map_src[m] = rd<uint32_t>(p); break; }
          case VC_TEXEFB: { uint8_t m = rd<uint8_t>(p); map_src[m] = 1ull << 32 | rd<uint32_t>(p); break; }
          case VC_FRAME: break;
@@ -585,9 +690,9 @@ index 80d48fd..72d1292 100644
 +                interp_frame_end();
 +            }
 +        }
-+    }
-+}
-+
+     }
+ }
+ 
 +void exec(const std::vector<uint8_t>& data) { exec_bytes(data.data(), data.size()); }
 +
 +void state_save(GXState& s) {
@@ -627,7 +732,16 @@ index 80d48fd..72d1292 100644
 +
 +void interp_frame_end() {
 +    uint32_t shown = last_xfb;
-+    if (st_start_ok && !fr_prev.draws.empty() && !fr_cur.draws.empty()) {
++    // behind (a whole frame from the game waits already): no halfway frame,
++    // so a slower PC falls back to 30 instead of slowing the game down
++    bool behind;
++    {
++        std::lock_guard<std::mutex> lk(qmx);
++        static const bool always = std::getenv("WIIKIT_INTERP_ALWAYS") != nullptr;   // testing on a slow machine
++        behind = !always && q_frames - exec_frames > 0;
++    }
++    if (behind) ++ist.busy;
++    if (!behind && st_start_ok && !fr_prev.draws.empty() && !fr_cur.draws.empty()) {
 +        state_save(st_live);
 +        state_load(st_start);
 +        std::swap(efb_fbo, mid_fbo);
@@ -687,15 +801,18 @@ index 80d48fd..72d1292 100644
 +    for (uint32_t i = 0; i < fr_prev.draws.size(); ++i) {
 +        prev_by_key[fr_prev.draws[i].key].push_back(i);
 +        prev_by_loose[fr_prev.draws[i].loose].push_back(i);
-     }
++    }
 +    state_save(st_start);                                      // the next frame starts from here
 +    st_start_ok = true;
++    start_copies_kept.clear();
 +    glBlitNamedFramebuffer(efb_fbo, start_fbo, 0, 0, EFB_W * S, EFB_H * S, 0, 0, EFB_W * S, EFB_H * S,
 +                           GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_NEAREST);
- }
- 
++}
++
  // ---- presenting -----------------------------------------------------------------------------------
-@@ -862,6 +1389,7 @@ constexpr uint32_t kStick = 1u << 16;               // L up, down, left, right,
+ uint32_t crc_table[256];
+ uint32_t crc32(const uint8_t* p, size_t n, uint32_t c = 0xFFFFFFFFu) {
+@@ -862,6 +1422,7 @@ constexpr uint32_t kStick = 1u << 16;               // L up, down, left, right,
  std::vector<Binding> bindings;
  int keys_input = INPUT_MODE_AUTO;                        // the key file's Input
  bool face_by_label = false;                         // the key file's Face Buttons = Label
@@ -703,7 +820,7 @@ index 80d48fd..72d1292 100644
  float dead_zone = 0.15f;                            // the key file's Dead Zone: of the sticks' travel, radial
  
  const char* DEFAULT_KEYS =
-@@ -890,7 +1418,8 @@ const char* DEFAULT_KEYS =
+@@ -890,7 +1451,8 @@ const char* DEFAULT_KEYS =
      "# wiiboot --input says the same).\n"
      "# The pad: its triggers are ZL and ZR, its shoulders L and R, Start +, Back -, its guide button Home.\n"
      "# Face Buttons = Position: the right one is A, the bottom one B, the top one X, the left one Y (the\n"
@@ -713,7 +830,7 @@ index 80d48fd..72d1292 100644
      "# Dead Zone: how far the pad's sticks move before they count, of their travel.\n"
      "Input        = Auto\n"
      "Face Buttons = Position\n"
-@@ -978,9 +1507,10 @@ bool parse_keys(const std::string& text, const std::string& path, bool remote, b
+@@ -978,9 +1540,10 @@ bool parse_keys(const std::string& text, const std::string& path, bool remote, b
                  continue;
              }
              if (SDL_strcasecmp(lhs.c_str(), "Face Buttons") == 0) {
@@ -727,7 +844,7 @@ index 80d48fd..72d1292 100644
                  continue;
              }
              if (SDL_strcasecmp(lhs.c_str(), "Dead Zone") == 0) {
-@@ -1107,6 +1637,7 @@ ClassicState classic_from_pad(SDL_Gamepad* g) {
+@@ -1107,6 +1670,7 @@ ClassicState classic_from_pad(SDL_Gamepad* g) {
      for (auto& f : face) {
          if (!SDL_GetGamepadButton(g, f.b)) continue;
          uint32_t bit = f.pos;
@@ -735,7 +852,48 @@ index 80d48fd..72d1292 100644
          if (face_by_label) switch (SDL_GetGamepadButtonLabel(g, f.b)) {
              case SDL_GAMEPAD_BUTTON_LABEL_A: case SDL_GAMEPAD_BUTTON_LABEL_CROSS: bit = CL_A; break;
              case SDL_GAMEPAD_BUTTON_LABEL_B: case SDL_GAMEPAD_BUTTON_LABEL_CIRCLE: bit = CL_B; break;
-@@ -1295,10 +1826,22 @@ void present() {
+@@ -1220,14 +1784,16 @@ void update_pad() {
+         hidden = p.pointer;
+         if (hidden) SDL_HideCursor(); else SDL_ShowCursor();
+     }
+-    // WIIKIT_PAD="45:A 50.5:@0.2,-0.1 51:A": at each time (seconds from
+-    // start) press buttons for 150 ms (A B 1 2 + - H U D L R, X = shake), or
+-    // move the pointer, which stays: reproducible runs for debugging
++    // WIIKIT_PAD="45:A 50.5:@0.2,-0.1 51:A 60:>1,0 62:>0,0": at each time
++    // (seconds from start) press buttons for 150 ms (A B 1 2 + - H U D L R,
++    // X = shake), or move the pointer, or hold the Classic's left (<) or
++    // right (>) stick, which stay: reproducible runs for debugging
+     static const char* script = std::getenv("WIIKIT_PAD");
+     uint32_t scripted = 0;
+     static const Clock::time_point t0 = Clock::now();
+     static float sx = 0, sy = 0;
+     static bool spointer = false;
++    static std::pair<float, float> s_lstick{0, 0}, s_rstick{0, 0};
+     if (script) {
+         double t = std::chrono::duration<double>(Clock::now() - t0).count();
+         for (const char* q = script; *q;) {
+@@ -1239,6 +1805,11 @@ void update_pad() {
+                 float x = std::strtof(q + 1, &e), y = std::strtof(e + 1, &e);
+                 if (t >= at) { sx = x; sy = y; spointer = true; }
+                 q = e;
++            } else if (*q == '<' || *q == '>') {          // "<x,y" the Classic's left stick, ">x,y" its right: held
++                bool right = *q == '>';
++                float x = std::strtof(q + 1, &e), y = std::strtof(e + 1, &e);
++                if (t >= at) (right ? s_rstick : s_lstick) = {x, y};
++                q = e;
+             } else {
+                 for (; *q && *q != ' '; ++q) {
+                     static const char names[] = "AB12+-HUDLR";
+@@ -1275,6 +1846,8 @@ void update_pad() {
+         k.ry = dir(4) - dir(5);
+         if (k.lx && k.ly) { k.lx *= 0.7071f; k.ly *= 0.7071f; }
+         if (k.rx && k.ry) { k.rx *= 0.7071f; k.ry *= 0.7071f; }
++        if (s_lstick.first || s_lstick.second) { k.lx = s_lstick.first; k.ly = s_lstick.second; }
++        if (s_rstick.first || s_rstick.second) { k.rx = s_rstick.first; k.ry = s_rstick.second; }
+         k.lt = k.buttons & CL_L ? 1.0f : 0.0f;
+         k.rt = k.buttons & CL_R ? 1.0f : 0.0f;
+     }
+@@ -1295,10 +1868,22 @@ void present() {
      glColorMask(1, 1, 1, 1);
      glClearColor(0, 0, 0, 1);
      glClear(GL_COLOR_BUFFER_BIT);
@@ -762,7 +920,7 @@ index 80d48fd..72d1292 100644
          Rect r = picture_rect((float)ww, (float)wh);
          int dx = (int)std::lround(r.x), dy = (int)std::lround(r.y);
          int dw = (int)std::lround(r.w), dh = (int)std::lround(r.h);
-@@ -1337,6 +1880,23 @@ void setup() {
+@@ -1337,6 +1922,23 @@ void setup() {
      glNamedFramebufferTexture(efb_fbo, GL_DEPTH_ATTACHMENT, efb_dep, 0);
      if (glCheckNamedFramebufferStatus(efb_fbo, GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
          rt_die("video: the EFB framebuffer is incomplete");
@@ -786,7 +944,7 @@ index 80d48fd..72d1292 100644
      glCreateFramebuffers(1, &copy_fbo);
      glBindFramebuffer(GL_FRAMEBUFFER, efb_fbo);
      glClearColor(0, 0, 0, 1);
-@@ -1391,6 +1951,7 @@ void setup() {
+@@ -1391,6 +1993,7 @@ void setup() {
      if (!copy_prog) rt_die("video: the EFB copy program does not build");
      copy_rect_loc = glGetUniformLocation(copy_prog, "u_rect");
      copy_mode_loc = glGetUniformLocation(copy_prog, "u_mode");
@@ -794,7 +952,7 @@ index 80d48fd..72d1292 100644
  }
  
  }  // namespace
-@@ -1524,7 +2085,8 @@ void video_run(const char* title) {
+@@ -1524,7 +2127,8 @@ void video_run(const char* title) {
      SDL_GLContext ctx = SDL_GL_CreateContext(win);
      if (!ctx) rt_die("video: no OpenGL 4.5 context: %s", SDL_GetError());
      SDL_GL_MakeCurrent(win, ctx);
@@ -804,7 +962,7 @@ index 80d48fd..72d1292 100644
      if (!gl_load()) rt_die("video: OpenGL functions missing");
      rt_log("video: %s, %s", (const char*)glGetString(GL_RENDERER), (const char*)glGetString(GL_VERSION));
      if (debug) {
-@@ -1586,6 +2148,13 @@ void video_run(const char* title) {
+@@ -1586,6 +2190,15 @@ void video_run(const char* title) {
                     (unsigned long long)cnt.frames, (unsigned long long)cnt.presents,
                     (unsigned long long)cnt.draws, (unsigned long long)cnt.programs,
                     (unsigned long long)cnt.linked, (unsigned long long)cnt.cached);
@@ -813,12 +971,14 @@ index 80d48fd..72d1292 100644
 +                       (unsigned long long)ist.frames, (unsigned long long)ist.draws, (unsigned long long)ist.matched,
 +                       (unsigned long long)ist.loose, (unsigned long long)ist.vtx);
 +            if (opt.interpolate)
-+                rt_log("video: frame pacing: %llu shown twice (none ready), %llu skipped (too many ready); %llu draws moved with the camera",
-+                       (unsigned long long)ist.repeats, (unsigned long long)ist.dropped, (unsigned long long)ist.camera);
++                rt_log("video: frame pacing: %llu shown twice (none ready), %llu skipped (too many ready); %llu draws moved with the camera; "
++                       "%llu halfway frames left out (the renderer behind)",
++                       (unsigned long long)ist.repeats, (unsigned long long)ist.dropped, (unsigned long long)ist.camera,
++                       (unsigned long long)ist.busy);
              gx_report();
              std::fflush(stdout);
              std::_Exit(0);
-@@ -1604,7 +2173,12 @@ void video_run(const char* title) {
+@@ -1604,7 +2217,12 @@ void video_run(const char* title) {
          if (now - t_title >= std::chrono::seconds(1)) {
              double s = std::chrono::duration<double>(now - t_title).count();
              char buf[256];
@@ -832,6 +992,16 @@ index 80d48fd..72d1292 100644
              SDL_SetWindowTitle(win, buf);
              if (g_vperf_on && cnt.frames > frames_then) {
                  double f = (double)(cnt.frames - frames_then);
+@@ -1628,7 +2246,9 @@ void video_run(const char* title) {
+             }
+             if (c.readback) { if (c.copy) copy_readback(c.copy); else efb_readback(); busy = true; continue; }
+             auto te = Clock::now();
++            exec_frames = c.frames;
+             exec(c.data);
++            exec_frames = 0;
+             if (g_vperf_on) g_vperf.draw += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - te).count();
+             {
+                 std::lock_guard<std::mutex> lk(qmx);
 diff --git a/runtime/video.h b/runtime/video.h
 index ecfb499..1ed4614 100644
 --- a/runtime/video.h
