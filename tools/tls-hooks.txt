@@ -8,3 +8,4 @@ atnTex_Unswizzle
 atnTex_Composite
 StrapTask_Update
 HBMRsoCreate
+LoadingIcon_Show

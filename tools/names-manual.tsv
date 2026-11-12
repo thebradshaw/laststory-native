@@ -63,3 +63,4 @@ addr	name	evidence
 806140C0	GXDrawDone	writes BP 0x45 (PE_DONE) through the pipe, pads with eight zero words, GXFlush (805EAA00), then sleeps on the draw-done queue (-0x5620(r13)) until the PE finish interrupt sets -0x5618(r13); with the SDK's other GX functions, between GXPokeBlendMode's neighbours
 805A646C	StrapTask_Update	the strap screen's state machine (state at +0x48, counters at +0x4C and +0x50; "/strap/strap%c_du.texture" is loaded by its neighbour 805A6270): 30 frames then a button, or 599 frames, then a 15 frame fade out
 80440F64	HBMRsoCreate	the game's HOME menu set-up: loads the layout archive and home.csv into its HBMDataInfo (r3), then HBMCreate
+8046ECDC	LoadingIcon_Show	the loading notice (data/d2anime/ui_loading.d2a, kept by the file system object at -0x61A8(r13), +0x3EE0): starts it, with message_0011 / string0011; 10 callers at screen transitions

@@ -269,11 +269,21 @@ void hbm_create(PPCContext& c) {
     std::_Exit(0);
 }
 
+// The loading notice (a leaf and "Loading", data/d2anime/ui_loading.d2a)
+// at screen transitions: never started, unless TLS_LOADING=1. Loads are
+// short on a PC.
+bool loading_notice = std::getenv("TLS_LOADING") && *std::getenv("TLS_LOADING") == '1';
+PPCFunc o_loading;
+void loading_show(PPCContext& c) {
+    if (loading_notice) o_loading(c);
+}
+
 void install() {
     o_unswizzle = ppc_hook("atnTex_Unswizzle", unswizzle);
     o_swap = ppc_hook("atnGfx_SwapFrame", swap_frame);
     o_strap = ppc_hook("StrapTask_Update", strap_update);
     o_hbm_create = ppc_hook("HBMRsoCreate", hbm_create);
+    o_loading = ppc_hook("LoadingIcon_Show", loading_show);
     if (!std::getenv("TLS_RESET_QUITS")) ppc_hook("OSRestart", restart);
     o_pre = ppc_hook("atnGfx_PreRetrace", [](PPCContext& c) { every_retrace(); ring("pre", c); o_pre(c); });
     if (want_fps == 60) rt_log("tls: 60 frames a second (the slow motion experiment), the speed halved");

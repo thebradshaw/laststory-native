@@ -1,8 +1,16 @@
 diff --git a/runtime/video.cpp b/runtime/video.cpp
-index 80d48fd..9742c34 100644
+index 80d48fd..72d1292 100644
 --- a/runtime/video.cpp
 +++ b/runtime/video.cpp
-@@ -29,7 +29,9 @@
+@@ -18,6 +18,7 @@
+ #include "rt.h"
+ #include <SDL3/SDL.h>
+ #include <algorithm>
++#include <array>
+ #include <atomic>
+ #include <cstddef>
+ #include <cstdlib>
+@@ -29,7 +30,9 @@
  #include <filesystem>
  #include <mutex>
  #include <string>
@@ -12,7 +20,7 @@ index 80d48fd..9742c34 100644
  #include <vector>
  
  #define WIIKIT_GL_DEFINE(T, n) T n = nullptr;
-@@ -114,6 +116,45 @@ std::unordered_map<std::string, GLuint> programs_by_source;
+@@ -114,6 +117,47 @@ std::unordered_map<std::string, GLuint> programs_by_source;
  struct Counters { uint64_t frames, presents, draws, programs, linked, cached; } cnt;
  bool dump_ps = false;                              // WIIKIT_SHADERDUMP: log the next uniforms
  
@@ -53,12 +61,49 @@ index 80d48fd..9742c34 100644
 +bool mid_mode = false, frame_ended = false, mid_xfb_made = false;
 +const uint8_t* cmd_start = nullptr;                // the command being executed
 +GLuint mid_fbo, mid_col, mid_dep, start_fbo, start_col, start_dep;
-+struct InterpStats { uint64_t frames, draws, matched, loose, vtx, repeats, dropped, shown; } ist;
++struct InterpStats { uint64_t frames, draws, matched, loose, vtx, repeats, dropped, shown, camera; } ist;
++float cam_delta[12];                               // the camera's move from this frame to the one before (static scenery's)
++bool cam_ok = false;
 +
  int32_t s11(uint32_t v) { return (int32_t)((v & 0x7FF) << 21) >> 21; }
  int32_t s10(uint32_t v) { return (int32_t)((v & 0x3FF) << 22) >> 22; }
  float fx(uint32_t a) { float f; std::memcpy(&f, &xf[a], 4); return f; }
-@@ -225,6 +266,30 @@ void save_program(GLuint p, uint64_t hash) {
+@@ -204,17 +248,31 @@ GLuint load_program(uint64_t hash) {
+     glProgramBinary(p, format, data.data() + 4, (GLsizei)(data.size() - 4));
+     GLint ok = 0;
+     glGetProgramiv(p, GL_LINK_STATUS, &ok);
+-    if (!ok) { glDeleteProgram(p); return 0; }
++    if (!ok) {
++        static bool told = false;
++        if (!told) { told = true; rt_log("video: the driver turned down a cached program (a new driver?): linking again"); }
++        glDeleteProgram(p);
++        return 0;
++    }
+     return p;
+ }
+ 
+ void save_program(GLuint p, uint64_t hash) {
+     if (opt.shader_cache.empty()) return;
+     static bool made = false;
+-    if (!made) { made = true; std::error_code ec; std::filesystem::create_directories(opt.shader_cache, ec); }
++    if (!made) {
++        made = true;
++        std::error_code ec;
++        std::filesystem::create_directories(opt.shader_cache, ec);
++        if (ec) rt_log("video: the shader cache %s cannot be made: %s", opt.shader_cache.c_str(), ec.message().c_str());
++    }
+     GLint len = 0;
+     glGetProgramiv(p, GL_PROGRAM_BINARY_LENGTH, &len);
+-    if (len <= 0) return;
++    if (len <= 0) {
++        static bool told = false;
++        if (!told) { told = true; rt_log("video: the driver gives no program binaries: the shader cache keeps sources only"); }
++        return;
++    }
+     std::vector<uint8_t> data(4 + (size_t)len);
+     GLenum format = 0;
+     glGetProgramBinary(p, len, nullptr, &format, data.data() + 4);
+@@ -225,6 +283,30 @@ void save_program(GLuint p, uint64_t hash) {
      }
  }
  
@@ -89,7 +134,7 @@ index 80d48fd..9742c34 100644
  void ensure_tex(Tex& t, int w, int h, int levels) {
      if (t.name && t.w == w && t.h == h && t.levels == levels) return;
      if (t.name) glDeleteTextures(1, &t.name);
-@@ -332,24 +397,29 @@ void efb_copy(uint32_t v) {
+@@ -332,24 +414,29 @@ void efb_copy(uint32_t v) {
      int w = (int)(bp[0x4A] & 0x3FF) + 1, h = (int)(bp[0x4A] >> 10 & 0x3FF) + 1;
      uint32_t dest = (bp[0x4B] & 0xFFFFFF) << 5;
      glDisable(GL_SCISSOR_TEST);
@@ -124,7 +169,7 @@ index 80d48fd..9742c34 100644
          ensure_tex(t, tw * S, th * S, 1);
          glNamedFramebufferTexture(copy_fbo, GL_COLOR_ATTACHMENT0, t.name, 0);
          glBindFramebuffer(GL_FRAMEBUFFER, copy_fbo);
-@@ -386,6 +456,37 @@ void bp_set(uint32_t v) {
+@@ -386,6 +473,37 @@ void bp_set(uint32_t v) {
  }
  
  // ---- draws --------------------------------------------------------------------------------------
@@ -155,14 +200,14 @@ index 80d48fd..9742c34 100644
 +        programs_by_source.emplace(std::move(source), p);
 +        n++;
 +    }
-+    rt_log("video: %u programs ready before play (%u linked now) in %.2f s", n, linked,
-+           std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
++    rt_log("video: %u programs ready before play (%u linked now) in %.2f s, cache %s", n, linked,
++           std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), opt.shader_cache.c_str());
 +}
 +
  GLuint program_for(uint8_t vflags) {
      std::string key = gx_shader_key(bp, xf, vflags);
      auto it = programs.find(key);
-@@ -401,6 +502,7 @@ GLuint program_for(uint8_t vflags) {
+@@ -401,6 +519,7 @@ GLuint program_for(uint8_t vflags) {
      GLuint p = load_program(hash);
      if (p) ++cnt.cached;
      else if ((p = link(vs, fs))) { ++cnt.linked; save_program(p, hash); }
@@ -170,7 +215,7 @@ index 80d48fd..9742c34 100644
      programs_by_source.emplace(std::move(source), p);
      if (const char* dir = std::getenv("WIIKIT_SHADERDUMP")) {           // debugging: the sources
          std::string path = std::string(dir) + "/prog_" + std::to_string(cnt.programs) + ".glsl";
-@@ -498,6 +600,8 @@ void bind_textures() {
+@@ -498,6 +617,8 @@ void bind_textures() {
          if (map_src[m] >> 32) {
              auto it = efb_copies.find((uint32_t)map_src[m]);
              if (it != efb_copies.end()) name = it->second.name;
@@ -179,7 +224,7 @@ index 80d48fd..9742c34 100644
          } else {
              auto it = texs.find((uint32_t)map_src[m]);
              if (it != texs.end()) name = it->second.name;
-@@ -522,6 +626,119 @@ void bind_textures() {
+@@ -522,6 +643,202 @@ void bind_textures() {
      }
  }
  
@@ -245,6 +290,89 @@ index 80d48fd..9742c34 100644
 +    return out;
 +}
 +
++// 3x4 affine helpers (row major, as XF holds them)
++void aff_mul(const float* a, const float* b, float* o) {       // o = a * b
++    for (int r = 0; r < 3; ++r)
++        for (int c = 0; c < 4; ++c)
++            o[r * 4 + c] = a[r * 4] * b[c] + a[r * 4 + 1] * b[4 + c] + a[r * 4 + 2] * b[8 + c] + (c == 3 ? a[r * 4 + 3] : 0);
++}
++bool aff_inv(const float* m, float* o) {
++    float a = m[0], b = m[1], c = m[2], d = m[4], e = m[5], f = m[6], g = m[8], h = m[9], i = m[10];
++    float det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
++    if (!(std::fabs(det) > 1e-12f)) return false;
++    float k = 1 / det;
++    float r[9] = {(e * i - f * h) * k, (c * h - b * i) * k, (b * f - c * e) * k,
++                  (f * g - d * i) * k, (a * i - c * g) * k, (c * d - a * f) * k,
++                  (d * h - e * g) * k, (b * g - a * h) * k, (a * e - b * d) * k};
++    for (int row = 0; row < 3; ++row) {
++        for (int col = 0; col < 3; ++col) o[row * 4 + col] = r[row * 3 + col];
++        o[row * 4 + 3] = -(r[row * 3] * m[3] + r[row * 3 + 1] * m[7] + r[row * 3 + 2] * m[11]);
++    }
++    return true;
++}
++
++// The camera's move between the two frames, from the scenery: for each
++// draw found in both with the same vertices (a mesh not moved on the CPU),
++// under a perspective projection, its matrix before times the inverse of
++// its matrix now; the median of each element over them (moving props are
++// the few). A cut, or too little scenery: none.
++void estimate_camera() {
++    cam_ok = false;
++    std::vector<std::array<float, 12>> d;
++    std::unordered_map<uint64_t, uint32_t> occ;
++    for (size_t i = 0; i < fr_cur.draws.size() && d.size() < 512; ++i) {
++        const DrawRec& b = fr_cur.draws[i];
++        uint32_t k = occ[b.key]++;
++        auto it = prev_by_key.find(b.key);
++        if (it == prev_by_key.end() || it->second.size() != cur_n_key[b.key]) continue;
++        const DrawRec& a = fr_prev.draws[it->second[k]];
++        if (a.vtx_len != b.vtx_len || b.vtx_len < 4 + sizeof(GVtx)) continue;
++        const uint32_t *xa = &fr_prev.xfs[(size_t)it->second[k] * XI_WORDS], *xb = &fr_cur.xfs[i * XI_WORDS];
++        if (xa[XI_POS + XI_NRM + 6] != 0 || xb[XI_POS + XI_NRM + 6] != 0) continue;   // orthographic: not scenery
++        if (std::memcmp(fr_prev.stream.data() + a.vtx_at, fr_cur.stream.data() + b.vtx_at, b.vtx_len)) continue;
++        uint32_t row = reinterpret_cast<const GVtx*>(fr_cur.stream.data() + b.vtx_at + 4)->mtx[0];
++        if (row * 4 + 12 > XI_POS) continue;
++        float ma[12], mb[12], ib[12], dl[12];
++        for (int j = 0; j < 12; ++j) { ma[j] = f32(xa[row * 4 + j]); mb[j] = f32(xb[row * 4 + j]); }
++        if (!aff_inv(mb, ib)) continue;
++        aff_mul(ma, ib, dl);
++        std::array<float, 12> e;
++        std::copy(dl, dl + 12, e.begin());
++        d.push_back(e);
++    }
++    if (d.size() < 8) return;
++    std::vector<float> col(d.size());
++    for (int j = 0; j < 12; ++j) {
++        for (size_t i = 0; i < d.size(); ++i) col[i] = d[i][j];
++        std::nth_element(col.begin(), col.begin() + col.size() / 2, col.end());
++        cam_delta[j] = col[col.size() / 2];
++    }
++    float dr = 0;                                              // a cut: the view turned too far
++    for (int r = 0; r < 3; ++r)
++        for (int c = 0; c < 3; ++c) dr = std::max(dr, std::fabs(cam_delta[r * 4 + c] - (r == c ? 1.0f : 0.0f)));
++    cam_ok = dr < 0.25f && std::isfinite(cam_delta[3] + cam_delta[7] + cam_delta[11]);
++}
++
++// An unmatched draw's matrices moved halfway with the camera: the position
++// matrices (D * M + M) / 2, the normal matrices likewise with D's rotation.
++const uint32_t* mid_camera(uint32_t* out) {
++    for (uint32_t g = 0; g + 12 <= 120; g += 12) {               // the 10 position matrices
++        float m[12], dm[12];
++        for (int j = 0; j < 12; ++j) m[j] = f32(out[g + j]);
++        aff_mul(cam_delta, m, dm);
++        for (int j = 0; j < 12; ++j) out[g + j] = u32((dm[j] + m[j]) * 0.5f);
++    }
++    for (uint32_t g = XI_POS; g + 9 <= XI_POS + XI_NRM; g += 9) {
++        float n[9], o[9];
++        for (int j = 0; j < 9; ++j) n[j] = f32(out[g + j]);
++        for (int r = 0; r < 3; ++r)
++            for (int c = 0; c < 3; ++c)
++                o[r * 3 + c] = cam_delta[r * 4] * n[c] + cam_delta[r * 4 + 1] * n[3 + c] + cam_delta[r * 4 + 2] * n[6 + c];
++        for (int j = 0; j < 9; ++j) out[g + j] = u32((o[j] + n[j]) * 0.5f);
++    }
++    return out;
++}
++
 +// The halfway frame's vertices: positions, normals, texture coordinates and
 +// colours halfway, where the
 +// draw's vertices moved on the CPU and not too far for its size.
@@ -299,7 +427,7 @@ index 80d48fd..9742c34 100644
  // A VC_DRAW's pieces (each n, then n vertices), drawn with one call.
  void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces) {
      uint32_t n = 0;
-@@ -530,6 +747,53 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
+@@ -530,6 +847,71 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
          std::memcpy(&k, pieces + (size_t)n * sizeof(GVtx) + 4 * i, 4);
          n += k;
      }
@@ -310,8 +438,20 @@ index 80d48fd..9742c34 100644
 +        for (int m = 0; m < 8; ++m)
 +            if (used >> m & 1) loose = mix64(loose, map_src[m] + (uint64_t)m * 0x9E37);
 +        if (n) loose = mix64(loose, reinterpret_cast<const GVtx*>(vtx)->mtx[0]);
-+        uint64_t key = mix64(loose, (uint64_t)n << 32 | npieces);
++        loose = mix64(loose, (uint64_t)n << 32 | npieces);
 +        size_t len = (size_t)n * sizeof(GVtx) + 4 * npieces;
++        // the exact kind: also where its first and last vertices are (a
++        // mesh that does not move on the CPU: scenery, props)
++        uint64_t key = loose;
++        if (n) {
++            uint32_t w[7];
++            const GVtx* v0 = reinterpret_cast<const GVtx*>(vtx);
++            const GVtx* v1 = reinterpret_cast<const GVtx*>(pieces + len - sizeof(GVtx));
++            std::memcpy(w, v0->pos, 12);
++            std::memcpy(w + 3, v1->pos, 12);
++            std::memcpy(w + 6, v0->tc[0], 4);
++            for (uint32_t x : w) key = mix64(key, x);
++        }
 +        if (!mid_mode) {
 +            fr_cur.draws.push_back({key, loose, fr_cur.stream.size() + (size_t)(pieces - cmd_start), len});
 +            size_t at = fr_cur.xfs.size();
@@ -334,13 +474,19 @@ index 80d48fd..9742c34 100644
 +            if (a) {
 +                ++(full ? ist.matched : ist.loose);
 +                lerp_xf = mid_matrices(&fr_prev.xfs[(size_t)(a - fr_prev.draws.data()) * XI_WORDS]);
-+                if (full && a->vtx_len == len && mid_vertices(fr_prev.stream.data() + a->vtx_at, pieces, npieces, moved)) {
++                if (a->vtx_len == len && mid_vertices(fr_prev.stream.data() + a->vtx_at, pieces, npieces, moved)) {
 +                    ++ist.vtx;
 +                    pieces = moved.data();
 +                    vtx = pieces + 4;
 +                }
 +            }
-+            if (!lerp_xf) lerp_xf = mid_matrices(nullptr);
++            if (!lerp_xf) {                                    // not found: moved with the camera, if it moved
++                lerp_xf = mid_matrices(nullptr);
++                if (cam_ok && xf[0x1026] == 0) {
++                    ++ist.camera;
++                    lerp_xf = mid_camera(const_cast<uint32_t*>(lerp_xf));
++                }
++            }
 +            static const char* dbg = std::getenv("WIIKIT_INTERPDEBUG");
 +            if (dbg && (long)cnt.frames == std::atol(dbg)) {
 +                uint32_t diff = 0;
@@ -353,7 +499,7 @@ index 80d48fd..9742c34 100644
      uint32_t cull = bp[0x00] >> 14 & 3;
      bool tri = prim < 0xA8;
      if (tri && cull == 3) return;
-@@ -591,11 +855,37 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
+@@ -591,11 +973,37 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
      if (tri && cull) { glEnable(GL_CULL_FACE); glCullFace(cull == 1 ? GL_BACK : GL_FRONT); }
      else glDisable(GL_CULL_FACE);
  
@@ -391,7 +537,7 @@ index 80d48fd..9742c34 100644
      set_ps_uniforms();
      bind_textures();
  
-@@ -722,10 +1012,12 @@ void copy_readback(uint32_t addr) {
+@@ -722,10 +1130,12 @@ void copy_readback(uint32_t addr) {
      rb_cv.notify_all();
  }
  
@@ -407,7 +553,7 @@ index 80d48fd..9742c34 100644
          switch (*p++) {
          case VC_BP: bp_set(rd<uint32_t>(p)); break;
          case VC_XF: {
-@@ -751,10 +1043,14 @@ void exec(const std::vector<uint8_t>& data) {
+@@ -751,10 +1161,14 @@ void exec(const std::vector<uint8_t>& data) {
              uint32_t id = rd<uint32_t>(p);
              int w = rd<uint16_t>(p), h = rd<uint16_t>(p), levels = rd<uint8_t>(p);
              Tex& t = texs[id];
@@ -424,7 +570,7 @@ index 80d48fd..9742c34 100644
                  p += (size_t)lw * lh * 4;
              }
              map_src[m] = id;
-@@ -763,10 +1059,122 @@ void exec(const std::vector<uint8_t>& data) {
+@@ -763,10 +1177,123 @@ void exec(const std::vector<uint8_t>& data) {
          case VC_TEXBIND: { uint8_t m = rd<uint8_t>(p); map_src[m] = rd<uint32_t>(p); break; }
          case VC_TEXEFB: { uint8_t m = rd<uint8_t>(p); map_src[m] = 1ull << 32 | rd<uint32_t>(p); break; }
          case VC_FRAME: break;
@@ -495,6 +641,7 @@ index 80d48fd..9742c34 100644
 +        cur_n_loose.clear();
 +        tex_ups.swap(tex_ups_cur);
 +        for (const DrawRec& d : fr_cur.draws) { ++cur_n_key[d.key]; ++cur_n_loose[d.loose]; }
++        estimate_camera();
 +        mid_copies_made.clear();                                // the last halfway frame's copies are not this one's
 +        mid_mode = true;
 +        mid_xfb_made = false;
@@ -548,7 +695,7 @@ index 80d48fd..9742c34 100644
  }
  
  // ---- presenting -----------------------------------------------------------------------------------
-@@ -862,6 +1270,7 @@ constexpr uint32_t kStick = 1u << 16;               // L up, down, left, right,
+@@ -862,6 +1389,7 @@ constexpr uint32_t kStick = 1u << 16;               // L up, down, left, right,
  std::vector<Binding> bindings;
  int keys_input = INPUT_MODE_AUTO;                        // the key file's Input
  bool face_by_label = false;                         // the key file's Face Buttons = Label
@@ -556,7 +703,7 @@ index 80d48fd..9742c34 100644
  float dead_zone = 0.15f;                            // the key file's Dead Zone: of the sticks' travel, radial
  
  const char* DEFAULT_KEYS =
-@@ -890,7 +1299,8 @@ const char* DEFAULT_KEYS =
+@@ -890,7 +1418,8 @@ const char* DEFAULT_KEYS =
      "# wiiboot --input says the same).\n"
      "# The pad: its triggers are ZL and ZR, its shoulders L and R, Start +, Back -, its guide button Home.\n"
      "# Face Buttons = Position: the right one is A, the bottom one B, the top one X, the left one Y (the\n"
@@ -566,7 +713,7 @@ index 80d48fd..9742c34 100644
      "# Dead Zone: how far the pad's sticks move before they count, of their travel.\n"
      "Input        = Auto\n"
      "Face Buttons = Position\n"
-@@ -978,9 +1388,10 @@ bool parse_keys(const std::string& text, const std::string& path, bool remote, b
+@@ -978,9 +1507,10 @@ bool parse_keys(const std::string& text, const std::string& path, bool remote, b
                  continue;
              }
              if (SDL_strcasecmp(lhs.c_str(), "Face Buttons") == 0) {
@@ -580,7 +727,7 @@ index 80d48fd..9742c34 100644
                  continue;
              }
              if (SDL_strcasecmp(lhs.c_str(), "Dead Zone") == 0) {
-@@ -1107,6 +1518,7 @@ ClassicState classic_from_pad(SDL_Gamepad* g) {
+@@ -1107,6 +1637,7 @@ ClassicState classic_from_pad(SDL_Gamepad* g) {
      for (auto& f : face) {
          if (!SDL_GetGamepadButton(g, f.b)) continue;
          uint32_t bit = f.pos;
@@ -588,7 +735,7 @@ index 80d48fd..9742c34 100644
          if (face_by_label) switch (SDL_GetGamepadButtonLabel(g, f.b)) {
              case SDL_GAMEPAD_BUTTON_LABEL_A: case SDL_GAMEPAD_BUTTON_LABEL_CROSS: bit = CL_A; break;
              case SDL_GAMEPAD_BUTTON_LABEL_B: case SDL_GAMEPAD_BUTTON_LABEL_CIRCLE: bit = CL_B; break;
-@@ -1295,10 +1707,22 @@ void present() {
+@@ -1295,10 +1826,22 @@ void present() {
      glColorMask(1, 1, 1, 1);
      glClearColor(0, 0, 0, 1);
      glClear(GL_COLOR_BUFFER_BIT);
@@ -615,7 +762,7 @@ index 80d48fd..9742c34 100644
          Rect r = picture_rect((float)ww, (float)wh);
          int dx = (int)std::lround(r.x), dy = (int)std::lround(r.y);
          int dw = (int)std::lround(r.w), dh = (int)std::lround(r.h);
-@@ -1337,6 +1761,23 @@ void setup() {
+@@ -1337,6 +1880,23 @@ void setup() {
      glNamedFramebufferTexture(efb_fbo, GL_DEPTH_ATTACHMENT, efb_dep, 0);
      if (glCheckNamedFramebufferStatus(efb_fbo, GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
          rt_die("video: the EFB framebuffer is incomplete");
@@ -639,7 +786,7 @@ index 80d48fd..9742c34 100644
      glCreateFramebuffers(1, &copy_fbo);
      glBindFramebuffer(GL_FRAMEBUFFER, efb_fbo);
      glClearColor(0, 0, 0, 1);
-@@ -1391,6 +1832,7 @@ void setup() {
+@@ -1391,6 +1951,7 @@ void setup() {
      if (!copy_prog) rt_die("video: the EFB copy program does not build");
      copy_rect_loc = glGetUniformLocation(copy_prog, "u_rect");
      copy_mode_loc = glGetUniformLocation(copy_prog, "u_mode");
@@ -647,7 +794,7 @@ index 80d48fd..9742c34 100644
  }
  
  }  // namespace
-@@ -1524,7 +1966,8 @@ void video_run(const char* title) {
+@@ -1524,7 +2085,8 @@ void video_run(const char* title) {
      SDL_GLContext ctx = SDL_GL_CreateContext(win);
      if (!ctx) rt_die("video: no OpenGL 4.5 context: %s", SDL_GetError());
      SDL_GL_MakeCurrent(win, ctx);
@@ -657,7 +804,7 @@ index 80d48fd..9742c34 100644
      if (!gl_load()) rt_die("video: OpenGL functions missing");
      rt_log("video: %s, %s", (const char*)glGetString(GL_RENDERER), (const char*)glGetString(GL_VERSION));
      if (debug) {
-@@ -1586,6 +2029,13 @@ void video_run(const char* title) {
+@@ -1586,6 +2148,13 @@ void video_run(const char* title) {
                     (unsigned long long)cnt.frames, (unsigned long long)cnt.presents,
                     (unsigned long long)cnt.draws, (unsigned long long)cnt.programs,
                     (unsigned long long)cnt.linked, (unsigned long long)cnt.cached);
@@ -666,12 +813,12 @@ index 80d48fd..9742c34 100644
 +                       (unsigned long long)ist.frames, (unsigned long long)ist.draws, (unsigned long long)ist.matched,
 +                       (unsigned long long)ist.loose, (unsigned long long)ist.vtx);
 +            if (opt.interpolate)
-+                rt_log("video: frame pacing: %llu shown twice (none ready), %llu skipped (too many ready)",
-+                       (unsigned long long)ist.repeats, (unsigned long long)ist.dropped);
++                rt_log("video: frame pacing: %llu shown twice (none ready), %llu skipped (too many ready); %llu draws moved with the camera",
++                       (unsigned long long)ist.repeats, (unsigned long long)ist.dropped, (unsigned long long)ist.camera);
              gx_report();
              std::fflush(stdout);
              std::_Exit(0);
-@@ -1604,7 +2054,12 @@ void video_run(const char* title) {
+@@ -1604,7 +2173,12 @@ void video_run(const char* title) {
          if (now - t_title >= std::chrono::seconds(1)) {
              double s = std::chrono::duration<double>(now - t_title).count();
              char buf[256];
@@ -699,7 +846,7 @@ index ecfb499..1ed4614 100644
  };
  enum { INPUT_MODE_AUTO, INPUT_MODE_PAD, INPUT_MODE_KEYBOARD };
 diff --git a/runtime/wiiboot.cpp b/runtime/wiiboot.cpp
-index 250d419..71e35f6 100644
+index 250d419..71892e2 100644
 --- a/runtime/wiiboot.cpp
 +++ b/runtime/wiiboot.cpp
 @@ -1,7 +1,7 @@
@@ -707,7 +854,7 @@ index 250d419..71e35f6 100644
  //
  //     wiiboot EXTRACT_DIR [--nand DIR] [--fonts DIR] [--symbols symbols.tsv] [--mmio-log] [--watch SECONDS]
 -//                         [--no-video] [--no-audio] [--scale N] [--frames-ahead N] [--dump DIR]
-+//                         [--no-video] [--no-audio] [--scale N] [--interpolate] [--vsync] [--frames-ahead N] [--dump DIR]
++//                         [--no-video] [--no-audio] [--scale N] [--interpolate] [--vsync] [--shader-cache DIR] [--frames-ahead N] [--dump DIR]
  //                         [--dump-every N] [--quit-after SECONDS] [--aspect 16:9|4:3]
  //                         [--language en|fr|es|de|it|nl|ja] [--fullscreen] [--window WxH] [--keys FILE]
  //                         [--input auto|pad|keyboard]
@@ -716,16 +863,26 @@ index 250d419..71e35f6 100644
          std::fprintf(stderr, "usage: wiiboot EXTRACT_DIR [--nand DIR] [--fonts DIR] [--symbols symbols.tsv] "
                               "[--mmio-log] [--watch SECONDS]\n"
 -                             "                            [--no-video] [--no-audio] [--scale N] [--frames-ahead N] "
-+                             "                            [--no-video] [--no-audio] [--scale N] [--interpolate] [--vsync] [--frames-ahead N] "
++                             "                            [--no-video] [--no-audio] [--scale N] [--interpolate] [--vsync] [--shader-cache DIR] [--frames-ahead N] "
                               "[--dump DIR] [--dump-every N] [--quit-after SECONDS]\n"
                               "                            [--aspect 16:9|4:3] [--language en|fr|es|de|it|nl|ja] "
                               "[--fullscreen] [--window WxH] [--keys FILE]\n"
-@@ -61,6 +61,8 @@ int main(int argc, char** argv) {
+@@ -61,6 +61,9 @@ int main(int argc, char** argv) {
          else if (!std::strcmp(argv[i], "--no-video")) vo.enabled = false;
          else if (!std::strcmp(argv[i], "--no-audio")) audio = false;
          else if (!std::strcmp(argv[i], "--scale") && i + 1 < argc) vo.scale = std::atoi(argv[++i]);
 +        else if (!std::strcmp(argv[i], "--interpolate")) vo.interpolate = true;
 +        else if (!std::strcmp(argv[i], "--vsync")) vo.vsync = true;
++        else if (!std::strcmp(argv[i], "--shader-cache") && i + 1 < argc) vo.shader_cache = argv[++i];
          else if (!std::strcmp(argv[i], "--frames-ahead") && i + 1 < argc) vo.frames_ahead = std::max(1, std::atoi(argv[++i]));
          else if (!std::strcmp(argv[i], "--dump") && i + 1 < argc) vo.dump_dir = argv[++i];
          else if (!std::strcmp(argv[i], "--dump-every") && i + 1 < argc) vo.dump_every = std::max(1, std::atoi(argv[++i]));
+@@ -97,7 +100,7 @@ int main(int argc, char** argv) {
+     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);
+     if (!mem_init()) rt_die("cannot reserve the guest address space");
+     if (vo.keys.empty()) vo.keys = root + "/../keys.txt";
+-    vo.shader_cache = root + "/../shadercache";
++    if (vo.shader_cache.empty()) vo.shader_cache = root + "/../shadercache";
+     const bool gamecube = disc_open(root.c_str()) && disc_is_gamecube();
+     if (!gamecube) vo.widescreen = sysconf_prepare(nand.c_str(), so);
+     uint32_t entry = boot_disc(root.c_str(), g_sysconf_eurgb60);
