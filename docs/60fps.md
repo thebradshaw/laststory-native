@@ -38,3 +38,23 @@ the camera.
 
 Linux, software rendering, so no real frame rates: at 60 the game runs from boot into
 Chapter 1's first tutorial without errors. Speeds are unverified until a run on a GPU.
+
+## Attempt 3: frame interpolation (current)
+
+The first two attempts changed the game's own stepping and drifted its
+timing (animation and event timing, reported on hardware). The third leaves
+the game at its own 30 fps and works in the renderer (`--interpolate`, in
+`patches/wiikit-local.patch`): each frame's command record is kept, and once
+the next frame is complete it is replayed a second time as the halfway
+frame. Each draw is matched to the frame before by what it draws (primitive,
+vertex format and count, bound textures, position matrix index; then the
+same without the count), and gets its position, texture, normal and
+projection matrices halfway between the two; vertices moved on the CPU
+(skinning, sprites) are lerped too. Matrices that change too much (a cut)
+and vertex jumps (a particle born again) are drawn as they are. The halfway
+frame has its own EFB and EFB copies and restores the renderer state after,
+so the real frame is untouched. It is shown one retrace before the real
+frame: 17 ms more latency. Headless check in Chapter 1: 99% of draws matched,
+the halfway frame equidistant from its neighbours. Debugging:
+`WIIKIT_INTERPDUMP=DIR,FIRST,COUNT,STRIDE`, `WIIKIT_INTERPDEBUG=FRAME`.
+The slow motion experiment is still there as `TLS_SLOWMO60=1`.
