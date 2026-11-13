@@ -115,7 +115,7 @@ index 7cd1d81..c391997 100644
 +void gxtex_decode_parallel(uint32_t fmt, int w, int h, const uint8_t* src, uint8_t* rgba,
 +                           const uint8_t* tlut = nullptr, uint32_t tlut_fmt = 0);
 diff --git a/runtime/video.cpp b/runtime/video.cpp
-index 80d48fd..db08b03 100644
+index 80d48fd..a134e39 100644
 --- a/runtime/video.cpp
 +++ b/runtime/video.cpp
 @@ -18,6 +18,7 @@
@@ -161,7 +161,7 @@ index 80d48fd..db08b03 100644
 +// blocks written where the GPU is done and bound there (glBufferSubData
 +// into the one block the GPU still reads made the driver wait or copy at
 +// every draw: thousands a frame, twice over with in-between frames)
-+constexpr size_t UBO_CAP = 16u << 20, UBO_QUARTER = UBO_CAP / 4;
++constexpr size_t UBO_CAP = 32u << 20, UBO_QUARTER = UBO_CAP / 4;
 +GLuint ubo_ring = 0;
 +uint8_t* ubo_ptr = nullptr;
 +size_t ubo_off = 0, ubo_align = 256;
@@ -172,8 +172,8 @@ index 80d48fd..db08b03 100644
 +uint32_t xa_epoch = 0, xb_epoch = 0, ps_epoch = 0;
 +
 +GLintptr ubo_put(const void* data, size_t n) {
++    static size_t q = 0;                                       // the quarter being written
 +    size_t at = (ubo_off + ubo_align - 1) / ubo_align * ubo_align;
-+    size_t q = ubo_off / UBO_QUARTER;
 +    if (at + n > (q + 1) * UBO_QUARTER) {                       // on to the next quarter
 +        ubo_fence[q] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 +        q = (q + 1) % 4;
@@ -902,6 +902,17 @@ index 80d48fd..db08b03 100644
      bind_textures();
  
      if (efb_dumping() && std::getenv("WIIKIT_DRAWLOG")) {         // debugging: where each draw lands
+@@ -621,8 +1128,8 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
+     }
+     size_t bytes = (size_t)n * sizeof(GVtx);
+     // a draw never straddles two quarters; offsets stay whole vertices
+-    size_t q = vbo_off / VBO_QUARTER;
+-    if ((vbo_off + bytes - 1) / VBO_QUARTER != q) {          // on to the next quarter: fence this one
++    static size_t q = 0;                                       // the quarter being written (an offset
++    if (vbo_off + bytes > (q + 1) * VBO_QUARTER) {           // at its very end is still this one's): on to the next, fence this one
+         vbo_fence[q] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+         q = (q + 1) % 4;
+         vbo_off = (q * VBO_QUARTER + sizeof(GVtx) - 1) / sizeof(GVtx) * sizeof(GVtx);
 @@ -722,10 +1229,12 @@ void copy_readback(uint32_t addr) {
      rb_cv.notify_all();
  }
