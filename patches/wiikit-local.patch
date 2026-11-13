@@ -116,7 +116,7 @@ index 7cd1d81..c391997 100644
 +void gxtex_decode_parallel(uint32_t fmt, int w, int h, const uint8_t* src, uint8_t* rgba,
 +                           const uint8_t* tlut = nullptr, uint32_t tlut_fmt = 0);
 diff --git a/runtime/video.cpp b/runtime/video.cpp
-index 80d48fd..35dba7d 100644
+index 80d48fd..9943d7d 100644
 --- a/runtime/video.cpp
 +++ b/runtime/video.cpp
 @@ -18,6 +18,7 @@
@@ -755,9 +755,9 @@ index 80d48fd..35dba7d 100644
 +                vo->pos[c] = (va->pos[c] + vo->pos[c]) * 0.5f;
 +                vo->nrm[c] = (va->nrm[c] + vo->nrm[c]) * 0.5f;
 +            }
-+            for (int t = 0; t < 8; ++t)                      // scrolled texture coordinates, not ones that wrapped
++            for (int t = 0; t < 8; ++t)                      // scrolled texture coordinates, not ones that wrapped or jumped a cell of an animation
 +                for (int c = 0; c < 2; ++c)
-+                    if (std::fabs(va->tc[t][c] - vo->tc[t][c]) < 0.25f) vo->tc[t][c] = (va->tc[t][c] + vo->tc[t][c]) * 0.5f;
++                    if (std::fabs(va->tc[t][c] - vo->tc[t][c]) < 0.05f) vo->tc[t][c] = (va->tc[t][c] + vo->tc[t][c]) * 0.5f;
 +            for (int k = 0; k < 2; ++k)
 +                for (int c = 0; c < 4; ++c) vo->col[k][c] = (uint8_t)((va->col[k][c] + vo->col[k][c] + 1) / 2);
 +        }
@@ -792,7 +792,7 @@ index 80d48fd..35dba7d 100644
  // A VC_DRAW's pieces (each n, then n vertices), drawn with one call.
  void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces) {
      uint32_t n = 0;
-@@ -530,73 +1027,211 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
+@@ -530,73 +1027,225 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
          std::memcpy(&k, pieces + (size_t)n * sizeof(GVtx) + 4 * i, 4);
          n += k;
      }
@@ -891,7 +891,7 @@ index 80d48fd..35dba7d 100644
 +                // kind: often another particle of the same effect, whose
 +                // halfway shape and colour came out dimmer than both frames
 +                bool additive = (bp[0x41] & 1) && !(bp[0x41] >> 11 & 1) && (bp[0x41] >> 5 & 7) == 1;
-+                if (!(additive && !full) && a->vtx_len == len && mid_vertices(fr_prev.stream.data() + a->vtx_at, pieces, npieces, moved)) {
++                if (!additive && a->vtx_len == len && mid_vertices(fr_prev.stream.data() + a->vtx_at, pieces, npieces, moved)) {
 +                    ++ist.vtx;
 +                    pieces = moved.data();
 +                    vtx = pieces + 4;
@@ -902,6 +902,20 @@ index 80d48fd..35dba7d 100644
 +                if (cam_ok && xf[0x1026] == 0) {
 +                    ++ist.camera;
 +                    lerp_xf = mid_camera(const_cast<uint32_t*>(lerp_xf));
++                }
++            }
++            // the draw's texture matrices as the real frame has them: they
++            // step through an animation's cells (fire, water, glows), and a
++            // matrix halfway between two cells shows neither
++            static const bool tex_lerp = std::getenv("WIIKIT_INTERP_TEXMTX") != nullptr;
++            if (n && !tex_lerp) {
++                uint32_t* o = const_cast<uint32_t*>(lerp_xf);
++                const GVtx* v0 = reinterpret_cast<const GVtx*>(vtx);
++                uint32_t ntg = std::min<uint32_t>(xf[0x103F] & 15, 8);
++                for (uint32_t i = 0; i < ntg; ++i) {
++                    uint32_t at = (uint32_t)v0->mtx[1 + i] * 4;
++                    if (at == (uint32_t)v0->mtx[0] * 4) continue;      // the position matrix itself
++                    for (uint32_t w = at; w < at + 12 && w < XI_POS; ++w) o[w] = xf[w];
 +                }
 +            }
 +            static const char* dbg = std::getenv("WIIKIT_INTERPDEBUG");
@@ -1036,7 +1050,7 @@ index 80d48fd..35dba7d 100644
      bind_textures();
  
      if (efb_dumping() && std::getenv("WIIKIT_DRAWLOG")) {         // debugging: where each draw lands
-@@ -621,8 +1256,8 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
+@@ -621,8 +1270,8 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
      }
      size_t bytes = (size_t)n * sizeof(GVtx);
      // a draw never straddles two quarters; offsets stay whole vertices
@@ -1047,7 +1061,7 @@ index 80d48fd..35dba7d 100644
          vbo_fence[q] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
          q = (q + 1) % 4;
          vbo_off = (q * VBO_QUARTER + sizeof(GVtx) - 1) / sizeof(GVtx) * sizeof(GVtx);
-@@ -722,10 +1357,12 @@ void copy_readback(uint32_t addr) {
+@@ -722,10 +1371,12 @@ void copy_readback(uint32_t addr) {
      rb_cv.notify_all();
  }
  
@@ -1063,7 +1077,7 @@ index 80d48fd..35dba7d 100644
          switch (*p++) {
          case VC_BP: bp_set(rd<uint32_t>(p)); break;
          case VC_XF: {
-@@ -751,10 +1388,14 @@ void exec(const std::vector<uint8_t>& data) {
+@@ -751,10 +1402,14 @@ void exec(const std::vector<uint8_t>& data) {
              uint32_t id = rd<uint32_t>(p);
              int w = rd<uint16_t>(p), h = rd<uint16_t>(p), levels = rd<uint8_t>(p);
              Tex& t = texs[id];
@@ -1080,7 +1094,7 @@ index 80d48fd..35dba7d 100644
                  p += (size_t)lw * lh * 4;
              }
              map_src[m] = id;
-@@ -763,10 +1404,137 @@ void exec(const std::vector<uint8_t>& data) {
+@@ -763,10 +1418,137 @@ void exec(const std::vector<uint8_t>& data) {
          case VC_TEXBIND: { uint8_t m = rd<uint8_t>(p); map_src[m] = rd<uint32_t>(p); break; }
          case VC_TEXEFB: { uint8_t m = rd<uint8_t>(p); map_src[m] = 1ull << 32 | rd<uint32_t>(p); break; }
          case VC_FRAME: break;
@@ -1219,7 +1233,7 @@ index 80d48fd..35dba7d 100644
  }
  
  // ---- presenting -----------------------------------------------------------------------------------
-@@ -862,6 +1630,7 @@ constexpr uint32_t kStick = 1u << 16;               // L up, down, left, right,
+@@ -862,6 +1644,7 @@ constexpr uint32_t kStick = 1u << 16;               // L up, down, left, right,
  std::vector<Binding> bindings;
  int keys_input = INPUT_MODE_AUTO;                        // the key file's Input
  bool face_by_label = false;                         // the key file's Face Buttons = Label
@@ -1227,7 +1241,7 @@ index 80d48fd..35dba7d 100644
  float dead_zone = 0.15f;                            // the key file's Dead Zone: of the sticks' travel, radial
  
  const char* DEFAULT_KEYS =
-@@ -890,7 +1659,8 @@ const char* DEFAULT_KEYS =
+@@ -890,7 +1673,8 @@ const char* DEFAULT_KEYS =
      "# wiiboot --input says the same).\n"
      "# The pad: its triggers are ZL and ZR, its shoulders L and R, Start +, Back -, its guide button Home.\n"
      "# Face Buttons = Position: the right one is A, the bottom one B, the top one X, the left one Y (the\n"
@@ -1237,7 +1251,7 @@ index 80d48fd..35dba7d 100644
      "# Dead Zone: how far the pad's sticks move before they count, of their travel.\n"
      "Input        = Auto\n"
      "Face Buttons = Position\n"
-@@ -978,9 +1748,10 @@ bool parse_keys(const std::string& text, const std::string& path, bool remote, b
+@@ -978,9 +1762,10 @@ bool parse_keys(const std::string& text, const std::string& path, bool remote, b
                  continue;
              }
              if (SDL_strcasecmp(lhs.c_str(), "Face Buttons") == 0) {
@@ -1251,7 +1265,7 @@ index 80d48fd..35dba7d 100644
                  continue;
              }
              if (SDL_strcasecmp(lhs.c_str(), "Dead Zone") == 0) {
-@@ -1107,6 +1878,7 @@ ClassicState classic_from_pad(SDL_Gamepad* g) {
+@@ -1107,6 +1892,7 @@ ClassicState classic_from_pad(SDL_Gamepad* g) {
      for (auto& f : face) {
          if (!SDL_GetGamepadButton(g, f.b)) continue;
          uint32_t bit = f.pos;
@@ -1259,7 +1273,7 @@ index 80d48fd..35dba7d 100644
          if (face_by_label) switch (SDL_GetGamepadButtonLabel(g, f.b)) {
              case SDL_GAMEPAD_BUTTON_LABEL_A: case SDL_GAMEPAD_BUTTON_LABEL_CROSS: bit = CL_A; break;
              case SDL_GAMEPAD_BUTTON_LABEL_B: case SDL_GAMEPAD_BUTTON_LABEL_CIRCLE: bit = CL_B; break;
-@@ -1220,14 +1992,16 @@ void update_pad() {
+@@ -1220,14 +2006,16 @@ void update_pad() {
          hidden = p.pointer;
          if (hidden) SDL_HideCursor(); else SDL_ShowCursor();
      }
@@ -1279,7 +1293,7 @@ index 80d48fd..35dba7d 100644
      if (script) {
          double t = std::chrono::duration<double>(Clock::now() - t0).count();
          for (const char* q = script; *q;) {
-@@ -1239,6 +2013,11 @@ void update_pad() {
+@@ -1239,6 +2027,11 @@ void update_pad() {
                  float x = std::strtof(q + 1, &e), y = std::strtof(e + 1, &e);
                  if (t >= at) { sx = x; sy = y; spointer = true; }
                  q = e;
@@ -1291,7 +1305,7 @@ index 80d48fd..35dba7d 100644
              } else {
                  for (; *q && *q != ' '; ++q) {
                      static const char names[] = "AB12+-HUDLR";
-@@ -1275,6 +2054,8 @@ void update_pad() {
+@@ -1275,6 +2068,8 @@ void update_pad() {
          k.ry = dir(4) - dir(5);
          if (k.lx && k.ly) { k.lx *= 0.7071f; k.ly *= 0.7071f; }
          if (k.rx && k.ry) { k.rx *= 0.7071f; k.ry *= 0.7071f; }
@@ -1300,7 +1314,7 @@ index 80d48fd..35dba7d 100644
          k.lt = k.buttons & CL_L ? 1.0f : 0.0f;
          k.rt = k.buttons & CL_R ? 1.0f : 0.0f;
      }
-@@ -1287,6 +2068,7 @@ void update_pad() {
+@@ -1287,6 +2082,7 @@ void update_pad() {
  }
  
  void present() {
@@ -1308,7 +1322,7 @@ index 80d48fd..35dba7d 100644
      ++cnt.presents;
      int ww = 0, wh = 0;
      SDL_GetWindowSizeInPixels(win, &ww, &wh);
-@@ -1295,10 +2077,22 @@ void present() {
+@@ -1295,10 +2091,22 @@ void present() {
      glColorMask(1, 1, 1, 1);
      glClearColor(0, 0, 0, 1);
      glClear(GL_COLOR_BUFFER_BIT);
@@ -1335,7 +1349,7 @@ index 80d48fd..35dba7d 100644
          Rect r = picture_rect((float)ww, (float)wh);
          int dx = (int)std::lround(r.x), dy = (int)std::lround(r.y);
          int dw = (int)std::lround(r.w), dh = (int)std::lround(r.h);
-@@ -1337,6 +2131,23 @@ void setup() {
+@@ -1337,6 +2145,23 @@ void setup() {
      glNamedFramebufferTexture(efb_fbo, GL_DEPTH_ATTACHMENT, efb_dep, 0);
      if (glCheckNamedFramebufferStatus(efb_fbo, GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
          rt_die("video: the EFB framebuffer is incomplete");
@@ -1359,7 +1373,7 @@ index 80d48fd..35dba7d 100644
      glCreateFramebuffers(1, &copy_fbo);
      glBindFramebuffer(GL_FRAMEBUFFER, efb_fbo);
      glClearColor(0, 0, 0, 1);
-@@ -1379,18 +2190,20 @@ void setup() {
+@@ -1379,18 +2204,20 @@ void setup() {
      }
      glBindVertexArray(vao);
  
@@ -1386,7 +1400,7 @@ index 80d48fd..35dba7d 100644
  }
  
  }  // namespace
-@@ -1524,7 +2337,9 @@ void video_run(const char* title) {
+@@ -1524,7 +2351,9 @@ void video_run(const char* title) {
      SDL_GLContext ctx = SDL_GL_CreateContext(win);
      if (!ctx) rt_die("video: no OpenGL 4.5 context: %s", SDL_GetError());
      SDL_GL_MakeCurrent(win, ctx);
@@ -1397,7 +1411,7 @@ index 80d48fd..35dba7d 100644
      if (!gl_load()) rt_die("video: OpenGL functions missing");
      rt_log("video: %s, %s", (const char*)glGetString(GL_RENDERER), (const char*)glGetString(GL_VERSION));
      if (debug) {
-@@ -1582,10 +2397,20 @@ void video_run(const char* title) {
+@@ -1582,10 +2411,20 @@ void video_run(const char* title) {
          auto now = Clock::now();
          if (opt.quit_after > 0 && std::chrono::duration<double>(now - t0).count() > opt.quit_after) quit = true;
          if (quit) {
@@ -1418,7 +1432,7 @@ index 80d48fd..35dba7d 100644
              gx_report();
              std::fflush(stdout);
              std::_Exit(0);
-@@ -1604,15 +2429,20 @@ void video_run(const char* title) {
+@@ -1604,15 +2443,20 @@ void video_run(const char* title) {
          if (now - t_title >= std::chrono::seconds(1)) {
              double s = std::chrono::duration<double>(now - t_title).count();
              char buf[256];
@@ -1442,7 +1456,7 @@ index 80d48fd..35dba7d 100644
              }
              frames_then = cnt.frames;
              t_title = now;
-@@ -1628,7 +2458,9 @@ void video_run(const char* title) {
+@@ -1628,7 +2472,9 @@ void video_run(const char* title) {
              }
              if (c.readback) { if (c.copy) copy_readback(c.copy); else efb_readback(); busy = true; continue; }
              auto te = Clock::now();
