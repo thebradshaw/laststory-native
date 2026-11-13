@@ -1,0 +1,53 @@
+# wiiboot's keys: each Wii Remote button, then the keys and mouse buttons that press it.
+# Keys by SDL's names (https://wiki.libsdl.org/SDL3/SDL_Scancode): A..Z, 0..9, Return,
+# Space, Tab, Backspace, Left Shift, Up, Down, Left, Right, Keypad Enter, F1..F10...
+# Mouse buttons: Mouse Left, Mouse Right, Mouse Middle, Mouse X1, Mouse X2; Drag Left, Drag Right,
+# Drag Middle: the button held and the mouse moving fast (a swing: Shake = Drag Left).
+# Fixed: Esc (the pause box), F11 and Alt+Enter (fullscreen), F12 (trace a frame's GX commands). Delete the file for the defaults.
+A     = Return, Keypad Enter, Mouse Left
+B     = Backspace, Mouse Right
+Up    = W, Up
+Down  = S, Down
+Left  = A, Left
+Right = D, Right
+Plus  = Tab
+Minus = Q
+1     = 1
+2     = 2
+Shake = Space, Mouse Middle
+
+[Classic Controller]
+# For a game that plays with the Classic Controller: its buttons and sticks on keys and mouse buttons.
+# A gamepad is a Classic Controller too, on the channels in the order the pads are plugged in. Channel 1
+# takes the keys, the mouse and the first pad at once (Input = Pad or Keyboard: only one of them;
+# wiiboot --input says the same).
+# The pad: its triggers are ZL and ZR, its shoulders L and R, Start +, Back -, its guide button Home.
+# Face Buttons = Position: the right one is A, the bottom one B, the top one X, the left one Y (the
+# Classic's own layout); Label: the button labelled A (Cross) is A, B (Circle) B, X (Square) X, Y (Triangle) Y.
+# Dead Zone: how far the pad's sticks move before they count, of their travel.
+Input        = Auto
+Face Buttons = Bottom A
+Dead Zone    = 0.15
+A     = Return, Space
+B     = Backspace, C
+X     = R
+Y     = F
+L     = Left Shift
+R     = E
+ZL    = Mouse Right
+ZR    = Mouse Left
+Plus  = Tab
+Minus = Q
+Home  = H
+Up    = Up
+Down  = Down
+Left  = Left
+Right = Right
+Left Stick Up    = W
+Left Stick Down  = S
+Left Stick Left  = A
+Left Stick Right = D
+Right Stick Up    =
+Right Stick Down  =
+Right Stick Left  =
+Right Stick Right =

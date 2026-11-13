@@ -7,7 +7,25 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <string>
 #include <thread>
+#include <vector>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
+// Half at 60 frames a second: what the recompiled code multiplies the engine's speed by (speed60.py).
+double g_tls_speed = [] { const char* e = std::getenv("TLS_SLOWMO60"); return e && *e == '1' ? 0.5 : 1.0; }();
 
 namespace {
 
@@ -67,7 +85,52 @@ void hitch_watch() {
 // once the ring is empty: its next frame's commands meet no breakpoint.
 // (TLS_AHEAD=1: the engine's own rule, a frame ahead.)
 bool ahead = std::getenv("TLS_AHEAD") != nullptr;
+
+// The frame rate. The engine steps by frames, 30 a second: its settings hold
+// a rate (+0x30 of the object at -0x6618(r13)), but only gravity reads it
+// (51 places, by its square); set to 60 alone, the game ran at twice its
+// speed (the first build that tried). What the whole world does follow is
+// the engine's one speed, the slow motion's (+0x3A4 of the object at
+// -0x6718(r13)). TLS_SLOWMO60=1: the frames flip at every retrace (the graphics
+// device's +0xCC cleared before its retrace callbacks read it) and every
+// consumer of the speed is handed half of it (g_tls_speed, by
+// tools/speed60.py in the recompiled code): half steps, twice as often.
+// What does not follow the speed runs twice as fast: an experiment.
+// TLS_FPSLOG=1 reports the frames presented per guest second.
+constexpr uint32_t kSda = 0x808856C0;
+uint32_t want_fps = [] { const char* e = std::getenv("TLS_SLOWMO60"); return e && *e == '1' ? 60u : 30u; }();
+bool fpslog = std::getenv("TLS_FPSLOG") != nullptr;
+uint64_t fps_t0 = 0;
+uint32_t fps_n = 0;
+void every_retrace() {
+    if (want_fps != 60) return;
+    if (uint32_t gd = ld32(kSda - 0x67E0)) st32(gd + 0xCC, 0);
+}
+void frame_rate() {
+    if (!fpslog) return;
+    uint64_t t = os_tb_now();
+    if (!fps_t0) fps_t0 = t;
+    fps_n++;
+    if (t - fps_t0 >= 60750000ull * 5) {
+        rt_log("tls: %.1f frames a second", fps_n / ((t - fps_t0) / 60750000.0));
+        fps_t0 = t; fps_n = 0;
+    }
+}
+
+// The wrist strap screen (StrapTask, its state at +0x48: 1 fading in, 0
+// waiting for a button or 599 frames, 2 fading out over 15 frames, then the
+// next sequence). Sent straight to the end of its fade out. TLS_STRAP=1
+// keeps it.
+bool strap = std::getenv("TLS_STRAP") != nullptr;
+PPCFunc o_strap;
+void strap_update(PPCContext& c) {
+    uint32_t t = c.r[3], state = ld32(t + 0x48);
+    if (!strap && state <= 1) { st32(t + 0x48, 2); st32(t + 0x4C, 14); }
+    o_strap(c);
+}
+
 void swap_frame(PPCContext& c) {
+    frame_rate();
     if (hitch_on) {
         int64_t now = now_us(), last = swap_at.exchange(now);
         uint32_t n = swaps.fetch_add(1) + 1;
@@ -94,6 +157,7 @@ void swap_frame(PPCContext& c) {
 // once with the wait above). The ring's queue is woken at every retrace too:
 // a lost wake-up costs a retrace at most.
 void post_retrace(PPCContext& c) {
+    every_retrace();
     ring("post", c);
     o_post(c);
     c.r[3] = kRingQueue;
@@ -113,9 +177,116 @@ void unswizzle(PPCContext& c) {                       // (data, format, w, h)
     o_unswizzle(c);
 }
 
+// The HOME menu, made for a PC: its "Wii Menu" button (which wiikit takes
+// as leaving) reads "Exit Game", and its question "Return to your desktop?". The
+// menu's font only has the glyphs its own messages use (no E, C or Q,
+// for one), hence the wording. The menu's files are loaded by HBMRsoCreate (HBMDataInfo: +0 the layout
+// archive, U8; +8 the messages, UTF-16 CSV), and the menu keeps pointing
+// into them: both are rewritten in place once it returns, the text at the
+// same length.
+const uint8_t kExitLabel[] = {
+#include "hbm-exit-label.inc"
+};
+PPCFunc o_hbm_create;
+
+// A file's bytes in a U8 archive at guest address a, by its name.
+uint32_t u8_file(uint32_t a, const char* name, uint32_t& size) {
+    if (!a || ld32(a) != 0x55AA382Du) return 0;
+    uint32_t root = a + ld32(a + 4), n = ld32(root + 8), names = root + n * 12;
+    if (n > 0x10000) return 0;
+    for (uint32_t i = 1; i < n; ++i) {
+        uint32_t node = root + i * 12, tn = ld32(node);
+        if (tn >> 24) continue;                                   // a directory
+        uint32_t k = 0, at = names + (tn & 0xFFFFFF);
+        while (name[k] && ld8(at + k) == (uint8_t)name[k]) ++k;
+        if (name[k] || ld8(at + k)) continue;
+        size = ld32(node + 8);
+        return a + ld32(node + 4);
+    }
+    return 0;
+}
+
+void hbm_label(uint32_t arc) {
+    uint32_t size = 0, tpl = u8_file(arc, "tx_btn_L_00.tpl", size);
+    if (!tpl || ld32(tpl) != 0x0020AF30u || !ld32(tpl + 4)) return;
+    // TPLBind may have made its offsets pointers already.
+    auto at = [tpl](uint32_t v) { return v >= 0x80000000u ? v : tpl + v; };
+    uint32_t img = at(ld32(at(ld32(tpl + 8))));                   // the first image's header
+    uint32_t data = at(ld32(img + 8));
+    if (ld16(img) != 64 || ld16(img + 2) != 240 || ld32(img + 4) != 0 || data + sizeof kExitLabel > tpl + size) return;
+    std::memcpy(host(data), kExitLabel, sizeof kExitLabel);
+    rt_log("tls: HOME menu: \"Wii Menu\" now reads \"Exit Game\"");
+}
+
+void hbm_text(uint32_t csv, uint32_t span) {
+    static const char16_t from[] = u"Return to the Wii Menu?\r\n(Anything not saved will be lost.)",
+                          to[] = u"Return to your desktop?\r\n(Anything not saved will be lost.)";
+    static_assert(sizeof from == sizeof to, "the CSV is rewritten in place");
+    constexpr uint32_t n = sizeof from / 2 - 1;
+    int done = 0;
+    for (uint32_t at = csv; at + n * 2 <= csv + span; at += 2) {
+        uint32_t k = 0;
+        while (k < n && ld16(at + k * 2) == from[k]) ++k;
+        if (k < n) continue;
+        for (k = 0; k < n; ++k) st16(at + k * 2, to[k]);
+        ++done;
+    }
+    if (done) rt_log("tls: HOME menu: its question now reads \"Return to your desktop?\" (%d)", done);
+}
+
+void hbm_create(PPCContext& c) {
+    uint32_t info = c.r[3];
+    o_hbm_create(c);
+    hbm_label(ld32(info));
+    uint32_t csv = ld32(info + 8);
+    if (csv && ld16(csv) == 0xFEFF) hbm_text(csv, 0x2000);       // home.csv: 4.5 KB
+}
+
+// The HOME menu's Reset (OSRestart): the game started again, where wiikit
+// would only leave.
+[[noreturn]] void restart(PPCContext&) {
+    std::fflush(stdout);
+    rt_log("tls: the game restarts");
+    std::fflush(stderr);
+#ifdef _WIN32
+    STARTUPINFOW si{};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (CreateProcessW(exe, GetCommandLineW(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+#else
+    std::ifstream f("/proc/self/cmdline", std::ios::binary);
+    std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::vector<char*> argv;
+    for (size_t i = 0; i < all.size(); i += std::strlen(&all[i]) + 1) argv.push_back(&all[i]);
+    argv.push_back(nullptr);
+    if (argv.size() > 1) execv("/proc/self/exe", argv.data());
+#endif
+    std::_Exit(0);
+}
+
+// The loading notice (a leaf and "Loading", data/d2anime/ui_loading.d2a)
+// at screen transitions: never started, unless TLS_LOADING=1. Loads are
+// short on a PC.
+bool loading_notice = std::getenv("TLS_LOADING") && *std::getenv("TLS_LOADING") == '1';
+PPCFunc o_loading;
+void loading_show(PPCContext& c) {
+    if (loading_notice) o_loading(c);
+}
+
 void install() {
     o_unswizzle = ppc_hook("atnTex_Unswizzle", unswizzle);
     o_swap = ppc_hook("atnGfx_SwapFrame", swap_frame);
+    o_strap = ppc_hook("StrapTask_Update", strap_update);
+    o_hbm_create = ppc_hook("HBMRsoCreate", hbm_create);
+    o_loading = ppc_hook("LoadingIcon_Show", loading_show);
+    if (!std::getenv("TLS_RESET_QUITS")) ppc_hook("OSRestart", restart);
+    o_pre = ppc_hook("atnGfx_PreRetrace", [](PPCContext& c) { every_retrace(); ring("pre", c); o_pre(c); });
+    if (want_fps == 60) rt_log("tls: 60 frames a second (the slow motion experiment), the speed halved");
     o_post = ppc_hook("atnGfx_PostRetrace", post_retrace);
     // The game plays with the Classic Controller (or the Remote and Nunchuk,
     // which wiikit has no Nunchuk for); it learns of controllers from KPAD's
@@ -131,7 +302,6 @@ void install() {
     }
     if (!gfxtrace) return;
     o_bp = ppc_hook("atnGfx_BreakPtCallback", [](PPCContext& c) { ring("bp", c); o_bp(c); ring("bp>", c); });
-    o_pre = ppc_hook("atnGfx_PreRetrace", [](PPCContext& c) { ring("pre", c); o_pre(c); });
 }
 
 RtGameLayer layer("The Last Story", install);

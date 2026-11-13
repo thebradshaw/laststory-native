@@ -18,11 +18,16 @@ if [ -n "$SYS" ]; then
   done
   python3 tools/sigmatch.py $B/extract/sys/main.dol --dsy "$SYS/totaldb.dsy" --out $B/sig_guess.tsv
 fi
+# Local changes to wiikit (patches/), applied once.
+for p in patches/wiikit-*.patch; do
+  git -C wiikit apply --reverse --check "../$p" 2>/dev/null || git -C wiikit apply "../$p"
+done
 python3 tools/names.py $B/extract/sys/main.dol
 python3 -m wiikit.recomp $B/extract/sys/main.dol --out $B/recomp \
   --symbols $B/names.tsv --hooks tools/tls-hooks.txt
+python3 tools/speed60.py $B/extract/sys/main.dol $B/recomp
 cmake -S $B/recomp -B $B/recomp-build -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE=-O1 -DWIIKIT_EXTRA="$ROOT/tools/tls.cmake" ${CMAKE_ARGS:-}
-ninja -C $B/recomp-build
+ninja -C $B/recomp-build wiiboot
 mkdir -p $B/run1 $B/nand
-echo "Run: cd $B/run1 && ../recomp-build/wiiboot ../extract --symbols ../recomp/symbols.tsv --nand ../nand --fonts ../fonts"
+echo "Run: cd $B/run1 && ../recomp-build/wiiboot ../extract --symbols ../recomp/symbols.tsv --nand ../nand --fonts ../fonts --keys $ROOT/config/keys-confirm-a.txt"

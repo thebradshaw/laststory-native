@@ -6,3 +6,6 @@ atnGfx_PreRetrace
 atnGfx_PostRetrace
 atnTex_Unswizzle
 atnTex_Composite
+StrapTask_Update
+HBMRsoCreate
+LoadingIcon_Show

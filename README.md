@@ -18,8 +18,9 @@ in the style of the title screen that walks the player through adding their disc
 
 ## Where it stands
 
-The USA disc boots through the strap screen to the title menu (`docs/usa.md`). Next: 60 fps,
-then the rest of the goals above.
+The USA disc boots and plays into Chapter 1 (`docs/usa.md`) at 30 frames a second. 60 is an
+experiment (`TLS_FPS=60`, `docs/60fps.md`). Next:
+the rest of the goals above.
 
 ## BYOA: Bring Your Own Assets
 
