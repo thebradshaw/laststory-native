@@ -1,3 +1,24 @@
+diff --git a/runtime/audio.cpp b/runtime/audio.cpp
+index 4050960..b50d298 100644
+--- a/runtime/audio.cpp
++++ b/runtime/audio.cpp
+@@ -25,7 +25,15 @@
+ 
+ namespace {
+ 
+-constexpr double kTarget = 0.02, kMaxQueue = 0.1;   // seconds
++// 50 ms by default: a game that loads a scene can leave the guest away from
++// its audio for longer than 20 ms, and every time the stream ran dry it was
++// heard as static. WIIKIT_AUDIO_MS sets it (10 to 200).
++double kTarget = [] {
++    const char* e = std::getenv("WIIKIT_AUDIO_MS");
++    double ms = e ? std::atof(e) : 50.0;
++    return std::clamp(ms, 10.0, 200.0) / 1000.0;
++}();
++double kMaxQueue = kTarget * 3 + 0.04;               // seconds
+ SDL_AudioStream* stream = nullptr;
+ bool dbg = std::getenv("WIIKIT_AUDIODBG") != nullptr;
+ double smoothed = 0;                                 // queued seconds, low-passed
 diff --git a/runtime/gl.h b/runtime/gl.h
 index 3d2da4e..f07fadc 100644
 --- a/runtime/gl.h
@@ -116,7 +137,7 @@ index 7cd1d81..c391997 100644
 +void gxtex_decode_parallel(uint32_t fmt, int w, int h, const uint8_t* src, uint8_t* rgba,
 +                           const uint8_t* tlut = nullptr, uint32_t tlut_fmt = 0);
 diff --git a/runtime/video.cpp b/runtime/video.cpp
-index 80d48fd..9943d7d 100644
+index 80d48fd..c90e9cc 100644
 --- a/runtime/video.cpp
 +++ b/runtime/video.cpp
 @@ -18,6 +18,7 @@
@@ -792,7 +813,7 @@ index 80d48fd..9943d7d 100644
  // A VC_DRAW's pieces (each n, then n vertices), drawn with one call.
  void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces) {
      uint32_t n = 0;
-@@ -530,73 +1027,225 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
+@@ -530,73 +1027,243 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
          std::memcpy(&k, pieces + (size_t)n * sizeof(GVtx) + 4 * i, 4);
          n += k;
      }
@@ -838,6 +859,23 @@ index 80d48fd..9943d7d 100644
 +            // a match by order whose matrix lands far from where the camera
 +            // would have taken it is another object of the same kind (the
 +            // order shifted): halfway between the two would put it nowhere
++            // the draw's size on screen terms: its vertices' reach from its
++            // origin, times its matrix's scale (a pairing is judged against
++            // the object's own size, not its distance: far off, a few
++            // percent of the distance is a whole wall section)
++            auto draw_size = [&](uint32_t row) {
++                float r2 = 0;
++                const uint8_t* q = pieces;
++                for (uint32_t i = 0, k, seen = 0; i < npieces && seen < 512; ++i) {
++                    std::memcpy(&k, q, 4);
++                    const GVtx* v = reinterpret_cast<const GVtx*>(q + 4);
++                    for (uint32_t j = 0; j < k && seen < 512; ++j, ++seen)
++                        r2 = std::max(r2, v[j].pos[0] * v[j].pos[0] + v[j].pos[1] * v[j].pos[1] + v[j].pos[2] * v[j].pos[2]);
++                    q += 4 + (size_t)k * sizeof(GVtx);
++                }
++                float sc = std::sqrt(fx(row * 4) * fx(row * 4) + fx(row * 4 + 4) * fx(row * 4 + 4) + fx(row * 4 + 8) * fx(row * 4 + 8));
++                return std::sqrt(r2) * sc;
++            };
 +            if (a && n && xf[0x1026] == 0) {
 +                uint32_t row = reinterpret_cast<const GVtx*>(vtx)->mtx[0];
 +                if (row * 4 + 12 <= XI_POS) {
@@ -850,7 +888,8 @@ index 80d48fd..9943d7d 100644
 +                        d2 += (p - tb[r]) * (p - tb[r]);
 +                        f2 += tb[r] * tb[r];
 +                    }
-+                    if (d2 > 0.15f * 0.15f * f2 && d2 > 1e-6f) { a = nullptr; full = false; ++ist.refused; }
++                    float lim = 0.5f * draw_size(row) + 0.01f * std::sqrt(f2);
++                    if (d2 > lim * lim && d2 > 1e-6f) { a = nullptr; full = false; ++ist.refused; }
 +                }
 +            }
 +            // the same mesh drawn a different number of times (one of several
@@ -875,7 +914,7 @@ index 80d48fd..9943d7d 100644
 +                        else if (d < second) second = d;
 +                    }
 +                    float dist = std::sqrt(tb[0] * tb[0] + tb[1] * tb[1] + tb[2] * tb[2]);
-+                    if (at != UINT32_MAX && best <= 0.05f * dist && best < 0.5f * second) {
++                    if (at != UINT32_MAX && best <= 0.25f * draw_size(row) + 0.005f * dist && best < 0.5f * second) {
 +                        prev_used.insert(at);
 +                        a = &fr_prev.draws[at];
 +                        full = true;
@@ -1050,7 +1089,7 @@ index 80d48fd..9943d7d 100644
      bind_textures();
  
      if (efb_dumping() && std::getenv("WIIKIT_DRAWLOG")) {         // debugging: where each draw lands
-@@ -621,8 +1270,8 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
+@@ -621,8 +1288,8 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
      }
      size_t bytes = (size_t)n * sizeof(GVtx);
      // a draw never straddles two quarters; offsets stay whole vertices
@@ -1061,7 +1100,7 @@ index 80d48fd..9943d7d 100644
          vbo_fence[q] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
          q = (q + 1) % 4;
          vbo_off = (q * VBO_QUARTER + sizeof(GVtx) - 1) / sizeof(GVtx) * sizeof(GVtx);
-@@ -722,10 +1371,12 @@ void copy_readback(uint32_t addr) {
+@@ -722,10 +1389,12 @@ void copy_readback(uint32_t addr) {
      rb_cv.notify_all();
  }
  
@@ -1077,7 +1116,7 @@ index 80d48fd..9943d7d 100644
          switch (*p++) {
          case VC_BP: bp_set(rd<uint32_t>(p)); break;
          case VC_XF: {
-@@ -751,10 +1402,14 @@ void exec(const std::vector<uint8_t>& data) {
+@@ -751,10 +1420,14 @@ void exec(const std::vector<uint8_t>& data) {
              uint32_t id = rd<uint32_t>(p);
              int w = rd<uint16_t>(p), h = rd<uint16_t>(p), levels = rd<uint8_t>(p);
              Tex& t = texs[id];
@@ -1094,7 +1133,7 @@ index 80d48fd..9943d7d 100644
                  p += (size_t)lw * lh * 4;
              }
              map_src[m] = id;
-@@ -763,10 +1418,137 @@ void exec(const std::vector<uint8_t>& data) {
+@@ -763,10 +1436,137 @@ void exec(const std::vector<uint8_t>& data) {
          case VC_TEXBIND: { uint8_t m = rd<uint8_t>(p); map_src[m] = rd<uint32_t>(p); break; }
          case VC_TEXEFB: { uint8_t m = rd<uint8_t>(p); map_src[m] = 1ull << 32 | rd<uint32_t>(p); break; }
          case VC_FRAME: break;
@@ -1233,7 +1272,7 @@ index 80d48fd..9943d7d 100644
  }
  
  // ---- presenting -----------------------------------------------------------------------------------
-@@ -862,6 +1644,7 @@ constexpr uint32_t kStick = 1u << 16;               // L up, down, left, right,
+@@ -862,6 +1662,7 @@ constexpr uint32_t kStick = 1u << 16;               // L up, down, left, right,
  std::vector<Binding> bindings;
  int keys_input = INPUT_MODE_AUTO;                        // the key file's Input
  bool face_by_label = false;                         // the key file's Face Buttons = Label
@@ -1241,7 +1280,7 @@ index 80d48fd..9943d7d 100644
  float dead_zone = 0.15f;                            // the key file's Dead Zone: of the sticks' travel, radial
  
  const char* DEFAULT_KEYS =
-@@ -890,7 +1673,8 @@ const char* DEFAULT_KEYS =
+@@ -890,7 +1691,8 @@ const char* DEFAULT_KEYS =
      "# wiiboot --input says the same).\n"
      "# The pad: its triggers are ZL and ZR, its shoulders L and R, Start +, Back -, its guide button Home.\n"
      "# Face Buttons = Position: the right one is A, the bottom one B, the top one X, the left one Y (the\n"
@@ -1251,7 +1290,7 @@ index 80d48fd..9943d7d 100644
      "# Dead Zone: how far the pad's sticks move before they count, of their travel.\n"
      "Input        = Auto\n"
      "Face Buttons = Position\n"
-@@ -978,9 +1762,10 @@ bool parse_keys(const std::string& text, const std::string& path, bool remote, b
+@@ -978,9 +1780,10 @@ bool parse_keys(const std::string& text, const std::string& path, bool remote, b
                  continue;
              }
              if (SDL_strcasecmp(lhs.c_str(), "Face Buttons") == 0) {
@@ -1265,7 +1304,7 @@ index 80d48fd..9943d7d 100644
                  continue;
              }
              if (SDL_strcasecmp(lhs.c_str(), "Dead Zone") == 0) {
-@@ -1107,6 +1892,7 @@ ClassicState classic_from_pad(SDL_Gamepad* g) {
+@@ -1107,6 +1910,7 @@ ClassicState classic_from_pad(SDL_Gamepad* g) {
      for (auto& f : face) {
          if (!SDL_GetGamepadButton(g, f.b)) continue;
          uint32_t bit = f.pos;
@@ -1273,7 +1312,7 @@ index 80d48fd..9943d7d 100644
          if (face_by_label) switch (SDL_GetGamepadButtonLabel(g, f.b)) {
              case SDL_GAMEPAD_BUTTON_LABEL_A: case SDL_GAMEPAD_BUTTON_LABEL_CROSS: bit = CL_A; break;
              case SDL_GAMEPAD_BUTTON_LABEL_B: case SDL_GAMEPAD_BUTTON_LABEL_CIRCLE: bit = CL_B; break;
-@@ -1220,14 +2006,16 @@ void update_pad() {
+@@ -1220,14 +2024,16 @@ void update_pad() {
          hidden = p.pointer;
          if (hidden) SDL_HideCursor(); else SDL_ShowCursor();
      }
@@ -1293,7 +1332,7 @@ index 80d48fd..9943d7d 100644
      if (script) {
          double t = std::chrono::duration<double>(Clock::now() - t0).count();
          for (const char* q = script; *q;) {
-@@ -1239,6 +2027,11 @@ void update_pad() {
+@@ -1239,6 +2045,11 @@ void update_pad() {
                  float x = std::strtof(q + 1, &e), y = std::strtof(e + 1, &e);
                  if (t >= at) { sx = x; sy = y; spointer = true; }
                  q = e;
@@ -1305,7 +1344,7 @@ index 80d48fd..9943d7d 100644
              } else {
                  for (; *q && *q != ' '; ++q) {
                      static const char names[] = "AB12+-HUDLR";
-@@ -1275,6 +2068,8 @@ void update_pad() {
+@@ -1275,6 +2086,8 @@ void update_pad() {
          k.ry = dir(4) - dir(5);
          if (k.lx && k.ly) { k.lx *= 0.7071f; k.ly *= 0.7071f; }
          if (k.rx && k.ry) { k.rx *= 0.7071f; k.ry *= 0.7071f; }
@@ -1314,7 +1353,7 @@ index 80d48fd..9943d7d 100644
          k.lt = k.buttons & CL_L ? 1.0f : 0.0f;
          k.rt = k.buttons & CL_R ? 1.0f : 0.0f;
      }
-@@ -1287,6 +2082,7 @@ void update_pad() {
+@@ -1287,6 +2100,7 @@ void update_pad() {
  }
  
  void present() {
@@ -1322,7 +1361,7 @@ index 80d48fd..9943d7d 100644
      ++cnt.presents;
      int ww = 0, wh = 0;
      SDL_GetWindowSizeInPixels(win, &ww, &wh);
-@@ -1295,10 +2091,22 @@ void present() {
+@@ -1295,10 +2109,22 @@ void present() {
      glColorMask(1, 1, 1, 1);
      glClearColor(0, 0, 0, 1);
      glClear(GL_COLOR_BUFFER_BIT);
@@ -1349,7 +1388,7 @@ index 80d48fd..9943d7d 100644
          Rect r = picture_rect((float)ww, (float)wh);
          int dx = (int)std::lround(r.x), dy = (int)std::lround(r.y);
          int dw = (int)std::lround(r.w), dh = (int)std::lround(r.h);
-@@ -1337,6 +2145,23 @@ void setup() {
+@@ -1337,6 +2163,23 @@ void setup() {
      glNamedFramebufferTexture(efb_fbo, GL_DEPTH_ATTACHMENT, efb_dep, 0);
      if (glCheckNamedFramebufferStatus(efb_fbo, GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
          rt_die("video: the EFB framebuffer is incomplete");
@@ -1373,7 +1412,7 @@ index 80d48fd..9943d7d 100644
      glCreateFramebuffers(1, &copy_fbo);
      glBindFramebuffer(GL_FRAMEBUFFER, efb_fbo);
      glClearColor(0, 0, 0, 1);
-@@ -1379,18 +2204,20 @@ void setup() {
+@@ -1379,18 +2222,20 @@ void setup() {
      }
      glBindVertexArray(vao);
  
@@ -1400,7 +1439,7 @@ index 80d48fd..9943d7d 100644
  }
  
  }  // namespace
-@@ -1524,7 +2351,9 @@ void video_run(const char* title) {
+@@ -1524,7 +2369,9 @@ void video_run(const char* title) {
      SDL_GLContext ctx = SDL_GL_CreateContext(win);
      if (!ctx) rt_die("video: no OpenGL 4.5 context: %s", SDL_GetError());
      SDL_GL_MakeCurrent(win, ctx);
@@ -1411,7 +1450,7 @@ index 80d48fd..9943d7d 100644
      if (!gl_load()) rt_die("video: OpenGL functions missing");
      rt_log("video: %s, %s", (const char*)glGetString(GL_RENDERER), (const char*)glGetString(GL_VERSION));
      if (debug) {
-@@ -1582,10 +2411,20 @@ void video_run(const char* title) {
+@@ -1582,10 +2429,20 @@ void video_run(const char* title) {
          auto now = Clock::now();
          if (opt.quit_after > 0 && std::chrono::duration<double>(now - t0).count() > opt.quit_after) quit = true;
          if (quit) {
@@ -1432,7 +1471,7 @@ index 80d48fd..9943d7d 100644
              gx_report();
              std::fflush(stdout);
              std::_Exit(0);
-@@ -1604,15 +2443,20 @@ void video_run(const char* title) {
+@@ -1604,15 +2461,20 @@ void video_run(const char* title) {
          if (now - t_title >= std::chrono::seconds(1)) {
              double s = std::chrono::duration<double>(now - t_title).count();
              char buf[256];
@@ -1456,7 +1495,7 @@ index 80d48fd..9943d7d 100644
              }
              frames_then = cnt.frames;
              t_title = now;
-@@ -1628,7 +2472,9 @@ void video_run(const char* title) {
+@@ -1628,7 +2490,9 @@ void video_run(const char* title) {
              }
              if (c.readback) { if (c.copy) copy_readback(c.copy); else efb_readback(); busy = true; continue; }
              auto te = Clock::now();
