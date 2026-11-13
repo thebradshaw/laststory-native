@@ -79,3 +79,19 @@ Also for lower-spec PCs: textures of 256x256 and up decode across threads
 game frame already waits (so the game never slows to wait for them).
 `WIIKIT_INTERP_ALWAYS=1` turns that off for tests; `WIIKIT_INTERPDEBUG=A,B`
 logs each halfway draw's match, blend and textures for frames A to B.
+
+### Build 16: one camera move for still scenery
+
+The camera's move between frames (`cam_delta`, the median over unmoved
+scenery) is made rigid and halved exactly (`cam_half`: quaternion half
+angle, translation solving (I + Rh) th = t). Matched draws that sit where
+the camera alone would take them are drawn with `cam_half` instead of their
+own element-wise lerp, so all still scenery moves as one. The pairing check
+predicted the frame before's position with `cam_delta` instead of its
+inverse (`cam_inv`); fixed (refusals in the cave test: 60k to 25k). Cuts:
+a turn over 50 degrees a frame (was about 14).
+
+Native 60 (the game stepping at 60) was tried twice before interpolation
+(see above) and drifted animation and event timing; doing it properly
+means finding every system that counts frames (events, camera, menus,
+timers), a larger job kept as an option.
